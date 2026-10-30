@@ -120,3 +120,14 @@ I checked 71 golf courses in the Scottsdale / east Phoenix area: **34 have 18 or
   3. In a second terminal, run `cloudflared tunnel --url http://localhost:8817` (free download, no account).
   4. Open the printed `https://….trycloudflare.com` link on the phone. It's temporary and changes on every restart.
 - **Permanent free link later:** GitHub Pages or Cloudflare Pages (both free, both need a free account). This is a static folder, so nothing needs to change.
+
+## v3 (Oct 2026): restyle, installable app, two-phone live play, email list
+
+- **Look:** "Desert Night" system blended from six AI mockups: sunset/palm welcome, bold condensed italic caps (Barlow Condensed, OFL, self-hosted woff2),
+  floating 3D hole with owner glow (green you / gold rival), Risk-style hex board over a desert-course aerial, trophy result, cart dashboard.
+  Generated art lives in `assets/` (webp, ~20-110 KB each). Sources: `ai-mockups/gen/assets-src/`, prompts in `ai-mockups/gen/gen_assets.py`.
+- **Install (PWA):** `manifest.webmanifest`, `sw.js` (app shell offline, course data cached on use), icons in `icons/`. All paths relative, so it works under `/fairway-conquest/`.
+  Android/Chrome shows an "Install the app" button on the welcome screen; iPhone Safari shows the Add to Home Screen hint.
+- **Two phones (`net.js`):** host picks "Each on own phone", gets a QR + link (`#join/<code>`). Friend scans, picks a seat, joins. PeerJS free public broker for the handshake,
+  then WebRTC phone to phone. Every change sends a full match snapshot; cells merge by timestamp, so reloads/dropped signal catch up. Same-phone pass-and-play still works.
+- **Email (Kit):** fill `KIT_FORM_ID` in `config.js`. Until then signups queue in localStorage (`fc.signups`) and are sent automatically once the ID is set.

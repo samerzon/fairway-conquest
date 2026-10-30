@@ -1,592 +1,79 @@
-/* Fairway Conquest (working title) — clickable prototype. No backend, state lives in localStorage. */
+/* Fairway Conquest v3 — head-to-head golf territory match.
+   Static HTML/CSS/JS, no backend. State lives in localStorage on each phone; two-phone matches sync peer to peer (net.js).
+   Format: a MATCH between 2 players (up to 4) on one real course. Win a hole to claim it; win by 2+ to also steal a touching rival hole.
+   Stakes are TRACKING ONLY: no money moves in this app. */
 (() => {
-  const KEY = "fairwayConquest.state";
+  const KEY = "fairwayConquest.match.v3";
   const $ = (s, el = document) => el.querySelector(s);
-  const view = $("#view"), sheetRoot = $("#sheet-root"), overlayRoot = $("#overlay-root"), tabbar = $("#tabbar");
-  const SQ3 = Math.sqrt(3), R = 30, HEX = 24;
-  const MAX_TROOPS = 6, MAX_BUFFER = 2;
-  const SET_VALUES = [4, 6, 8, 10, 12, 15];
+  const app = $("#app"), view = $("#view"), sheetRoot = $("#sheet-root"), overlayRoot = $("#overlay-root"), tabbar = $("#tabbar");
+  const SQ3 = Math.sqrt(3), R = 30, HEX = 26;
+  const COLORS = ["#2EE58A", "#FFB547", "#5AB4FF", "#FF6FA8"];         // you = fairway green, rival = desert sun, later seats
+  const INK = ["#05140b", "#1d1102", "#04121f", "#22050f"];
+  const QUICK = [
+    { type: "way", id: 61499695, name: "Camelback Golf Club", area: "Scottsdale, AZ" },
+    { type: "way", id: 78388948, name: "TPC Scottsdale Stadium Course", area: "Scottsdale, AZ" }
+  ];
 
   // ---------- state ----------
-  function fresh() {
-    const s = JSON.parse(JSON.stringify(window.FC_SEED));
-    const holes = {};
-    for (const [id, [par, yards, owner, strokes, troops, verified]] of Object.entries(s.holes))
-      holes[id] = { id, par, yards, owner, strokes, troops, verified };
-    s.boards = { demo: { key: "demo", kind: "demo", name: "Demo board (fictional courses)", courses: s.courses, holes, bridges: s.bridges, storm: s.season.stormCourse } };
-    delete s.courses; delete s.holes; delete s.bridges; delete s.season.stormCourse;
-    s.active = "demo"; s.outdoor = false; s.round = {}; s.partner = "none"; s.units = "yd";
-    return s;
-  }
+  const blankDraft = () => ({ boardKey: null, range: "all", players: [{ name: "You" }, { name: "" }], mode: "local", stake: { type: "none", hole: 5, match: 20 } });
+  function fresh() { return { v: 3, onboarded: false, outdoor: false, boards: {}, draft: blankDraft(), match: null, history: [] }; }
   let S;
-  /** S.holes / S.courses / S.bridges / S.season.stormCourse always point at the active board (not serialized twice). */
-  function bindState() {
-    const B = () => S.boards[S.active] || S.boards.demo;
-    for (const k of ["holes", "courses", "bridges"]) Object.defineProperty(S, k, { get: () => B()[k], configurable: true, enumerable: false });
-    Object.defineProperty(S.season, "stormCourse", { get: () => B().storm, set: v => { B().storm = v; }, configurable: true, enumerable: false });
-  }
   try { S = JSON.parse(localStorage.getItem(KEY)); } catch (e) { S = null; }
-  if (!S || S.version !== window.FC_SEED.version) S = fresh();
-  bindState();
-  const save = () => localStorage.setItem(KEY, JSON.stringify(S));
-  const board = () => S.boards[S.active] || S.boards.demo;
+  if (!S || S.v !== 3) S = fresh();
+  const save = () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} };
   save();
 
-  // ---------- rules helpers ----------
-  const P = id => S.players[id];
-  const course = id => S.courses[id[0]];
-  const num = id => id.slice(1);
-  const rel = h => h.strokes == null ? null : h.strokes - h.par;
-  const relTxt = r => r == null ? "—" : r === 0 ? "E" : r > 0 ? "+" + r : "" + r;
-  const buffer = h => Math.min(MAX_BUFFER, Math.floor((h.troops || 0) / 3));
-  const locked = id => !S.unlocked && !course(id).free;
+  // ---------- small helpers ----------
+  const esc = t => String(t ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  const shortName = n => String(n).replace(/\s*(Golf Club|Golf Course|Country Club|Golf Resort)\b/i, "").replace(/\s+·\s+/, " · ");
+  const rel = n => n === 0 ? "E" : n > 0 ? "+" + n : "−" + -n;
+  const yd = m => m == null ? "—" : Math.round(m / 0.9144);
+  const money = n => (n < 0 ? "−$" : "$") + Math.abs(Math.round(n * 100) / 100);
   const scoreName = (strokes, par) => {
-    const d = strokes - par;
-    if (strokes === 1) return "Ace";
+    const d = strokes - par; if (strokes === 1) return "Ace";
     return ({ "-3": "Albatross", "-2": "Eagle", "-1": "Birdie", "0": "Par", "1": "Bogey", "2": "Double" })[d] || (d < -3 ? "Unreal" : "Triple+");
   };
-  const sandbagger = (r, hcp) => r <= hcp / 18 - 2.4;
-
-  function center(id) {
-    const hh = S.holes[id]; if (hh && hh.pos) return hh.pos;
-    const c = course(id), i = +num(id) - 1, row = Math.floor(i / 3);
-    const col = row % 2 === 0 ? i % 3 : 2 - (i % 3);
-    const w = SQ3 * R;
-    return [c.origin[0] + col * w + (row % 2) * w / 2, c.origin[1] + row * 1.5 * R];
-  }
-  let adjCache = { key: null, map: null };
-  function adjMap() {
-    if (adjCache.key === S.active && adjCache.map) return adjCache.map;
-    const ADJ = {}, ids = Object.keys(S.holes), any = board().kind !== "demo";
-    ids.forEach(a => ADJ[a] = new Set());
-    for (const a of ids) for (const b of ids) {
-      if (a >= b || (!any && a[0] !== b[0])) continue;
-      const [x1, y1] = center(a), [x2, y2] = center(b);
-      if (Math.hypot(x1 - x2, y1 - y2) < SQ3 * R * 1.1) { ADJ[a].add(b); ADJ[b].add(a); }
-    }
-    for (const [a, b] of S.bridges) { if (ADJ[a] && ADJ[b]) { ADJ[a].add(b); ADJ[b].add(a); } }
-    adjCache = { key: S.active, map: ADJ };
-    return ADJ;
-  }
-  const neighbors = id => [...(adjMap()[id] || [])].sort((a, b) => a[0] === b[0] ? +a.slice(1) - +b.slice(1) : a.localeCompare(b));
-
-  function counts() {
-    const c = {}; Object.keys(S.players).forEach(p => c[p] = 0);
-    Object.values(S.holes).forEach(h => h.owner && c[h.owner]++);
-    return c;
-  }
-  function continentsOf(pid) {
-    return Object.keys(S.courses).filter(cid => Object.values(S.holes).filter(h => h.id[0] === cid).every(h => h.owner === pid));
-  }
-  function courseCount(pid, cid) { return Object.values(S.holes).filter(h => h.id[0] === cid && h.owner === pid).length; }
-  function income(pid = "me") {
-    const n = counts()[pid], base = Math.max(3, Math.floor(n / 3));
-    const conts = continentsOf(pid), bonus = conts.reduce((a, c) => a + S.courses[c].bonus, 0);
-    return { n, base, conts, bonus, total: base + bonus };
-  }
-  function standings() {
-    const c = counts();
-    return Object.values(S.players).map(p => ({ ...p, n: c[p.id], troops: Object.values(S.holes).filter(h => h.owner === p.id).reduce((a, h) => a + h.troops, 0), conts: continentsOf(p.id) }))
-      .sort((a, b) => b.n - a.n || b.troops - a.troops);
-  }
-  const ord = n => n + (["th", "st", "nd", "rd"][(n % 100 - 20) % 10] || ["th", "st", "nd", "rd"][n % 100] || "th");
-  const nextSetValue = () => SET_VALUES[S.tradeCount] ?? (15 + 5 * (S.tradeCount - 5));
-
-  /** Target to beat: you need rel strictly below (holder rel - effective buffer). */
-  function needToTake(h, cancel = 0) {
-    if (!h.owner) return null;
-    const eff = Math.max(0, buffer(h) - cancel);
-    const target = rel(h) - eff;            // tie at target goes to defender
-    return { eff, target, strokes: h.par + target - 1 };
-  }
-
-  // ---------- svg helpers ----------
+  let toastT;
+  function toast(msg) { const t = $("#toast"); t.innerHTML = msg; t.classList.add("show"); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("show"), 2600); }
   function hexPts(cx, cy, r) {
     const p = [];
     for (let k = 0; k < 6; k++) { const a = Math.PI / 180 * (60 * k - 30); p.push((cx + r * Math.cos(a)).toFixed(1) + "," + (cy + r * Math.sin(a)).toFixed(1)); }
     return p.join(" ");
   }
-  const ownerColor = h => h.owner ? P(h.owner).color : "#E6D6B4";
-  function hexSvg(color, label, opts = {}) {
-    const { sub = "", stroke = "#fff", w = 74, h = 80 } = opts;
-    return `<svg viewBox="0 0 100 108" width="${w}" height="${h}" class="${opts.cls || ""}">
-      <defs><linearGradient id="g${label}${color.slice(1)}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".35"/><stop offset=".55" stop-color="#fff" stop-opacity="0"/></linearGradient></defs>
-      <polygon points="${hexPts(50, 56, 47)}" fill="rgba(0,0,0,.25)"/>
-      <polygon points="${hexPts(50, 52, 47)}" fill="${color}" stroke="${stroke}" stroke-width="4" stroke-linejoin="round"/>
-      <polygon points="${hexPts(50, 52, 47)}" fill="url(#g${label}${color.slice(1)})"/>
-      <text x="50" y="${sub ? 58 : 64}" text-anchor="middle" font-family="Unbounded" font-weight="900" font-size="${sub ? 30 : 36}" fill="#fff">${label}</text>
-      ${sub ? `<text x="50" y="80" text-anchor="middle" font-family="Bricolage" font-weight="700" font-size="13" fill="#fff" opacity=".85">${sub}</text>` : ""}
-    </svg>`;
-  }
   const ICONS = {
     flag: '<path d="M6 21V4M6 4h11l-2.5 4L17 12H6"/>',
-    alert: '<path d="M12 3l9.5 17h-19z"/><path d="M12 10v4M12 17.5v.5"/>',
-    storm: '<path d="M3 8h11a3 3 0 1 0-3-3M3 12h15a3 3 0 1 1-3 3M3 16h7"/>',
-    shield: '<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>',
     help: '<circle cx="12" cy="12" r="9"/><path d="M9.5 9.5a2.5 2.5 0 1 1 3.5 2.3c-.6.3-1 .9-1 1.6v.6M12 17v.5"/>',
-    lock: '<rect x="5" y="11" width="14" height="10" rx="2.5"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
     close: '<path d="M6 6l12 12M18 6L6 18"/>',
     swords: '<path d="M4 4l9 9M4 4v4M4 4h4M20 4l-9 9M20 4v4M20 4h-4M7 17l-3 3M17 17l3 3M9 15l-2 2M15 15l2 2"/>',
     plus: '<path d="M12 5v14M5 12h14"/>',
     map: '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/>',
     check: '<path d="M5 12.5l4.5 4.5L19 7"/>',
-    cards: '<rect x="3" y="4" width="11" height="15" rx="2"/><path d="M17 6l3.5 1.5-4.5 12-4-1.6"/>',
     trophy: '<path d="M7 4h10v5a5 5 0 0 1-10 0zM7 6H4a3 3 0 0 0 3 4M17 6h3a3 3 0 0 1-3 4M12 14v4M8 21h8"/>',
     redo: '<path d="M4 12a8 8 0 1 0 2.4-5.7L4 8.5M4 4v4.5h4.5"/>',
     eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
     users: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0M16 4.5a3.5 3.5 0 0 1 0 7M18 14a6 6 0 0 1 3.5 6"/>',
     share: '<path d="M12 3v12M7 8l5-5 5 5M5 14v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5"/>',
-    sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'
+    sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+    cart: '<rect x="3" y="4" width="18" height="12" rx="2.5"/><path d="M8 20h8M12 16v4"/>',
+    phone: '<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/>',
+    search: '<circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/>',
+    dollar: '<path d="M12 3v18M16.5 7.5c-.8-1.3-2.4-2-4.5-2-2.6 0-4.3 1.3-4.3 3.2 0 4.6 9 2.3 9 6.8 0 2-1.9 3.3-4.7 3.3-2.2 0-3.9-.8-4.8-2.3"/>',
+    chev: '<path d="M9 5l7 7-7 7"/>',
+    back: '<path d="M15 5l-7 7 7 7"/>',
+    more: '<circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/>',
+    wifi: '<path d="M2.5 9a14 14 0 0 1 19 0M5.5 12.5a9.5 9.5 0 0 1 13 0M8.8 16a4.8 4.8 0 0 1 6.4 0"/><circle cx="12" cy="19.3" r=".8"/>',
+    copy: '<rect x="8" y="8" width="12" height="12" rx="2.5"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
+    mail: '<rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M3.5 6.5l8.5 6.5 8.5-6.5"/>',
+    qr: '<rect x="3.5" y="3.5" width="7" height="7" rx="1"/><rect x="13.5" y="3.5" width="7" height="7" rx="1"/><rect x="3.5" y="13.5" width="7" height="7" rx="1"/><path d="M14 14h2.5v2.5H14zM18 18h2.5v2.5H18z"/>',
+    download: '<path d="M12 4v11M7 10l5 5 5-5M5 20h14"/>',
+    pin: '<path d="M12 21s-6.5-5.6-6.5-11A6.5 6.5 0 0 1 18.5 10c0 5.4-6.5 11-6.5 11z"/><circle cx="12" cy="10" r="2.3"/>'
   };
   const ic = (n, color = "currentColor", extra = "") => `<svg viewBox="0 0 24 24" style="stroke:${color};fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round" ${extra}>${ICONS[n]}</svg>`;
-  const shieldsHtml = (b) => `<span class="shields">${[0, 1].map(i => `<svg viewBox="0 0 24 26"><path d="M12 2l9 3.5v7c0 6-4 9.5-9 11.5-5-2-9-5.5-9-11.5v-7z" fill="${i < b ? "#FFB13B" : "rgba(255,240,220,.12)"}" stroke="${i < b ? "#ffe2a8" : "rgba(255,240,220,.2)"}" stroke-width="1.5"/></svg>`).join("")}</span>`;
-  const avatar = (p, size = "") => `<div class="avatar" style="background:${p.color};${size}">${p.short}</div>`;
-  const demoChip = `<span class="chip demo">Demo data</span>`;
+  /** Palm silhouette (Arizona touch). */
+  const palm = (x, y, s = 1, op = 1) => `<g transform="translate(${x},${y}) scale(${s})" opacity="${op}"><path d="M0 0c2-40 6-80 14-118l5 1c-7 38-11 78-12 117z"/>
+    <path d="M16 -118c-18-8-40-6-58 8 18-4 36-4 52 0zM16 -118c-10-16-30-26-52-24 18 4 34 12 46 26zM18 -118c4-18 18-32 38-36-14 10-24 22-30 38zM18 -118c18-6 40-2 56 12-18-2-36-4-52-6zM18 -116c14 6 26 20 30 38-10-14-20-24-34-32zM14 -116c-12 8-20 22-22 38 6-14 14-26 26-34z"/></g>`;
 
-  const CARD_ART = {
-    driver: '<ellipse cx="62" cy="52" rx="26" ry="16" fill="#123a66"/><ellipse cx="58" cy="48" rx="20" ry="9" fill="#2f6bb8"/><path d="M40 46L14 6" stroke="#123a66" stroke-width="5" stroke-linecap="round"/><circle cx="22" cy="62" r="6" fill="#fff"/>',
-    iron: '<path d="M44 40l26 4c4 1 5 6 2 9L56 66c-4 3-12 2-14-3l-4-14z" fill="#0f4d2c"/><path d="M48 44l18 3" stroke="#bfe9cf" stroke-width="2"/><path d="M42 42L22 4" stroke="#0f4d2c" stroke-width="5" stroke-linecap="round"/><circle cx="76" cy="64" r="6" fill="#fff"/>',
-    putter: '<rect x="36" y="50" width="42" height="12" rx="4" fill="#6b2e0d"/><path d="M48 50L34 6" stroke="#6b2e0d" stroke-width="5" stroke-linecap="round"/><circle cx="22" cy="58" r="6" fill="#fff"/><ellipse cx="80" cy="68" rx="9" ry="3" fill="#6b2e0d" opacity=".5"/>',
-    ace: '<ellipse cx="50" cy="62" rx="34" ry="9" fill="#7a1d33" opacity=".35"/><path d="M50 62V8" stroke="#5a1222" stroke-width="3.5" stroke-linecap="round"/><path d="M51 9h26l-7 9 7 9H51z" fill="#fff"/><text x="62" y="23" font-family="Unbounded" font-weight="900" font-size="12" fill="#c8243f" text-anchor="middle">1</text><circle cx="50" cy="62" r="5" fill="#5a1222"/>',
-    mull: '<path d="M30 40a20 20 0 1 0 6-14" fill="none" stroke="#2b1466" stroke-width="7" stroke-linecap="round"/><path d="M26 14l10 12-14 3z" fill="#2b1466"/><circle cx="50" cy="40" r="6" fill="#fff"/>'
-  };
-  const CARD_NAMES = { driver: "Driver", iron: "Iron", putter: "Putter", ace: "Ace", mull: "Mulligan" };
-  const CARD_FOOT = { driver: "Set card", iron: "Set card", putter: "Set card", ace: "Wild", mull: "Re-post a hole" };
-  const cardHtml = (t, i, sel) => `<button class="gcard ${t} ${sel ? "sel" : ""}" data-card="${i}"><span class="ctype">${CARD_NAMES[t]}</span>
-    <svg class="cart" viewBox="0 0 100 76">${CARD_ART[t]}</svg><span class="cfoot">${CARD_FOOT[t]}</span><span class="check">${ic("check")}</span></button>`;
-
-  // ---------- toast ----------
-  let toastT;
-  function toast(msg) { const t = $("#toast"); t.innerHTML = msg; t.classList.add("show"); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("show"), 2600); }
-
-  // ---------- topbar ----------
-  function topbar() {
-    return `<header class="topbar"><div class="brand"><div class="brand-mark"><svg viewBox="0 0 24 24"><path d="M7 21V3l11 4.5L9 12"/><path d="M7 21V3" stroke="#1b0f08" stroke-width="2.6" fill="none"/></svg></div>
-      <div class="brand-name">Fairway Conquest<small>WORKING TITLE · PROTOTYPE</small></div></div>
-      <div class="top-actions">${S.unlocked ? "" : `<a href="#unlock" class="lock-pill">${ICONS.lock ? ic("lock") : ""}$6</a>`}<a class="icon-btn" href="#how" aria-label="How to play">${ic("help")}</a></div></header>`;
-  }
-
-  // ---------- HOME ----------
-  function renderHome() {
-    const st = standings(), meIdx = st.findIndex(p => p.id === "me"), me = st[meIdx], inc = income();
-    const max = Math.max(...st.map(p => p.n));
-    const stormC = S.courses[S.season.stormCourse];
-    const feedIc = { flag: ["flag", "#FF6A2B"], alert: ["alert", "#F2577A"], storm: ["storm", "#E7CFA4"], shield: ["shield", "#FFB13B"] };
-    view.innerHTML = `<div class="screen">${topbar()}
-      <section class="hero">
-        <div class="eyebrow" style="color:#ffe2a8">${S.season.name} · Week ${S.season.week}/${S.season.weeks}</div>
-        <div class="rank">${meIdx + 1}<sup>${ord(meIdx + 1).replace(/\d+/, "")}</sup></div>
-        <p>${meIdx === 0 ? "You're on top. Act like you've been there." : `${st[0].name} is ${st[0].n - me.n} holes up. Go get 'em.`}</p>
-        <div class="hero-stats">
-          <div class="hero-stat"><b>${me.n}</b><span>Holes</span></div>
-          <div class="hero-stat"><b>${S.myTroops}</b><span>Troops</span></div>
-          <div class="hero-stat"><b>${S.cards.length}</b><span>Cards</span></div>
-        </div>
-        <svg class="hero-hex" viewBox="0 0 120 110">${[[38, 34, "#FF6A2B"], [82, 34, "#FFB13B"], [60, 72, "#F3E2C2"]].map(([x, y, c]) => `<polygon points="${hexPts(x, y, 24)}" fill="${c}" stroke="rgba(255,255,255,.7)" stroke-width="2.5"/>`).join("")}
-          <path d="M60 60V38" stroke="#1b0f08" stroke-width="3" stroke-linecap="round"/><path d="M61 38h14l-4 5 4 5H61z" fill="#1b0f08"/></svg>
-      </section>
-      <div class="storm"><div class="storm-ic">${ic("storm")}</div><div><b>Haboob hits ${stormC.name}</b><span>Every fort there resets Sunday. Strike now.</span></div></div>
-      <a class="course-card" href="${board().kind === "demo" ? "#courses" : "#play"}"><div class="cc-ic">${ic(board().kind === "demo" ? "map" : "flag", "#1b0f08")}</div>
-        <div class="who"><span class="eyebrow" style="font-size:10px">${board().kind === "demo" ? "Playing the demo board" : "Your course"}</span><b>${board().kind === "demo" ? "Sync your real course" : esc(shortName(board().name))}</b><span>${board().kind === "demo" ? "Any course on OpenStreetMap · GPS yardages" : `${Object.keys(S.holes).length} holes · GPS on-course mode`}</span></div><svg class="chev" viewBox="0 0 24 24" width="22" height="22" style="stroke:#6b4a26;fill:none;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round"><path d="M9 5l7 7-7 7"/></svg></a>
-      <div class="cta-row"><a class="btn primary" style="flex:1.3" href="#map">${ic("map")}Open the map</a><a class="btn ghost" style="flex:1" href="#how">How to play</a></div>
-      <div class="section-head"><h2 class="h2">Season standings</h2>${demoChip}</div>
-      <div class="standings">${st.map((p, i) => `<div class="row ${p.id === "me" ? "me" : ""}"><div class="pos">${i + 1}</div>${avatar(p)}
-        <div class="who"><b>${p.name}${p.conts.map(c => `<span class="cbadge" style="background:${S.courses[c].color}">${S.courses[c].name.split(" ")[0].toUpperCase()}</span>`).join("")}</b><span>${p.hcp} hcp · ${p.troops} troops on the board</span>
-        <div class="bar"><i style="width:${(p.n / max) * 100}%;background:${p.color};animation-delay:${i * 60}ms"></i></div></div>
-        <div class="terr"><b>${p.n}</b><span>holes</span></div></div>`).join("")}</div>
-      <div class="section-head"><h2 class="h2">Clubhouse chatter</h2><span class="muted" style="font-size:12px">Demo feed</span></div>
-      <div class="feed">${S.feed.slice(0, 6).map(f => `<div class="feed-item"><div class="feed-ic">${ic(feedIc[f.icon][0], feedIc[f.icon][1])}</div><div>${f.text}</div><time>${f.t}</time></div>`).join("")}</div>
-      <p class="fineprint">Prototype. Rival players and their scores are fake demo data. ${board().kind === "demo" ? "The demo board's courses are fictional." : `Course layout from OpenStreetMap (© OpenStreetMap contributors, ODbL).`}</p>
-    </div>`;
-    if (!S.onboarded) showOnboarding();
-  }
-
-  function showOnboarding() {
-    overlayRoot.innerHTML = `<div class="onb"><div class="onb-sun"></div>
-      <svg class="onb-hills" viewBox="0 0 390 300" preserveAspectRatio="none"><path d="M0 120 Q60 70 120 110 T240 95 T390 100 V300 H0z" fill="#8a3a18"/><path d="M0 170 Q90 120 180 160 T390 150 V300 H0z" fill="#5c2410"/>
-      <g fill="#2a140a"><path d="M300 150v-46a7 7 0 0 1 14 0v46zM292 128v-14a5 5 0 0 1 10 0v14h-4v-10zM312 120v-10a5 5 0 0 1 10 0v18h-10z"/><path d="M70 175v-34a5 5 0 0 1 10 0v34zM64 160v-9a4 4 0 0 1 8 0v9z"/></g></svg>
-      <div class="onb-card"><div class="eyebrow">Fairway Conquest · working title</div><h1 class="h1">Own the course.<br>One hole at a time.</h1>
-        <p>Every hole is territory. Post the lowest score and it's yours. Hold a whole course for bonus troops.</p>
-        <div class="onb-steps"><div class="onb-step"><i>1</i>Shoot a hole lower than the holder.</div><div class="onb-step"><i>2</i>Stack troops so they need to beat you by more.</div><div class="onb-step"><i>3</i>Most holes at season's end wins.</div></div>
-        <button class="btn primary block" id="onb-go">Let's go</button><div class="sub">Demo crew and scores are fake. Nothing leaves your phone.</div></div></div>`;
-    $("#onb-go").onclick = () => { S.onboarded = true; save(); overlayRoot.innerHTML = ""; };
-  }
-
-  // ---------- MAP ----------
-  let selected = null, pulseId = null;
-  function boardSvg() {
-    const holes = Object.values(S.holes);
-    let land = "", terr = "", links = "", bridges = "", labels = "", veils = "";
-    for (const c of Object.values(S.courses)) {
-      const ids = holes.filter(h => h.id[0] === c.id).map(h => h.id);
-      land += ids.map(id => { const [x, y] = center(id); return `<polygon points="${hexPts(x, y + 3, R + 9)}" fill="rgba(90,60,30,.18)"/>`; }).join("");
-      land += ids.map(id => { const [x, y] = center(id); return `<polygon points="${hexPts(x, y, R + 9)}" fill="${c.color}"/>`; }).join("");
-      land += ids.map(id => { const [x, y] = center(id); return `<polygon points="${hexPts(x, y, R + 5.5)}" fill="${c.tint}"/>`; }).join("");
-    }
-    const LABELS = board().kind === "demo" ? { S: [36, 22, "start"], C: [338, 202, "end"], D: [36, 576, "start"] } : null;
-    for (const c of Object.values(S.courses)) {
-      if (!LABELS) { if (locked(c.id + Object.values(S.holes).find(h => h.id[0] === c.id).id.slice(1))) {
-          const ids = holes.filter(h => h.id[0] === c.id).map(h => h.id);
-          const cx = ids.reduce((a, id) => a + center(id)[0], 0) / ids.length, cy = ids.reduce((a, id) => a + center(id)[1], 0) / ids.length;
-          veils += `<g class="locked-veil">${ids.map(id => { const [x, y] = center(id); return `<polygon points="${hexPts(x, y, R + 9.5)}" fill="rgba(245,229,198,.72)"/>`; }).join("")}
-            <g transform="translate(${cx - 46},${cy - 20})"><rect width="92" height="40" rx="20" fill="#1b0f08"/><g transform="translate(14,10)" stroke="#FFB13B" stroke-width="2.4" fill="none" stroke-linecap="round"><rect x="1" y="8" width="16" height="11" rx="3"/><path d="M4.5 8V5.5a4.5 4.5 0 0 1 9 0V8"/></g><text x="58" y="25" text-anchor="middle" font-size="12" font-weight="800" fill="#FFB13B">$6</text></g></g>`; }
-        continue; }
-      const [lx, ly, anchor] = LABELS[c.id], held = continentsOf("me").includes(c.id);
-      const storm = S.season.stormCourse === c.id;
-      const wpx = c.name.length * 8.3 + 56;
-      const x0 = anchor === "end" ? lx - wpx : lx;
-      labels += `<g><rect x="${x0}" y="${ly}" rx="11" width="${wpx}" height="24" fill="${c.color}"/>
-        <text x="${x0 + 10}" y="${ly + 16}" font-size="10.5" font-weight="800" fill="#fff" style="letter-spacing:.02em">${c.name.toUpperCase()}</text>
-        <rect x="${x0 + wpx - 34}" y="${ly + 4}" rx="7" width="30" height="16" fill="rgba(255,255,255,.22)"/><text x="${x0 + wpx - 19}" y="${ly + 15.5}" text-anchor="middle" font-size="9" font-weight="800" fill="#fff">+${c.bonus}</text>
-        ${storm ? `<g transform="translate(${anchor === "end" ? x0 - 30 : x0 + wpx + 6},${ly - 2})"><circle cx="12" cy="14" r="13" fill="#E7CFA4" stroke="#b08a5a" stroke-width="1.5"/><path d="M5 11h9a2.5 2.5 0 1 0-2.5-2.5M5 14.5h12a2.5 2.5 0 1 1-2.5 2.5M5 18h5" stroke="#6b4a26" stroke-width="2" fill="none" stroke-linecap="round"/></g>` : ""}</g>`;
-      if (locked(c.id + "1")) {
-        const ids = holes.filter(h => h.id[0] === c.id).map(h => h.id);
-        const cx = ids.reduce((a, id) => a + center(id)[0], 0) / 9, cy = ids.reduce((a, id) => a + center(id)[1], 0) / 9;
-        veils += `<g class="locked-veil">${ids.map(id => { const [x, y] = center(id); return `<polygon points="${hexPts(x, y, R + 9.5)}" fill="rgba(245,229,198,.72)"/>`; }).join("")}
-          <g transform="translate(${cx - 46},${cy - 20})"><rect width="92" height="40" rx="20" fill="#1b0f08"/><g transform="translate(14,10)" stroke="#FFB13B" stroke-width="2.4" fill="none" stroke-linecap="round"><rect x="1" y="8" width="16" height="11" rx="3"/><path d="M4.5 8V5.5a4.5 4.5 0 0 1 9 0V8"/></g>
-          <text x="58" y="25" text-anchor="middle" font-size="12" font-weight="800" fill="#FFB13B">$6</text></g></g>`;
-      }
-    }
-    const seen = new Set();
-    const ADJ = adjMap();
-    for (const a of Object.keys(ADJ)) for (const b of ADJ[a]) {
-      const k = [a, b].sort().join("-"); if (seen.has(k)) continue; seen.add(k);
-      const [x1, y1] = center(a), [x2, y2] = center(b);
-      if (S.bridges.some(([p, q]) => (p === a && q === b) || (p === b && q === a)) || (board().kind === "demo" && a[0] !== b[0])) { bridges += `<path class="bridge" d="M${x1} ${y1} Q ${(x1 + x2) / 2 + (y2 - y1) * .18} ${(y1 + y2) / 2 - (x2 - x1) * .18} ${x2} ${y2}"/>`; continue; }
-      const d = Math.hypot(x2 - x1, y2 - y1), ux = (x2 - x1) / d, uy = (y2 - y1) / d, s = 15, e = d - 15;
-      links += `<line x1="${x1 + ux * s}" y1="${y1 + uy * s}" x2="${x1 + ux * e}" y2="${y1 + uy * e}" stroke="rgba(60,40,20,.55)" stroke-width="6" stroke-linecap="round"/><line x1="${x1 + ux * s}" y1="${y1 + uy * s}" x2="${x1 + ux * e}" y2="${y1 + uy * e}" stroke="#FFF6E8" stroke-width="2.5" stroke-linecap="round"/>`;
-    }
-    for (const h of holes) {
-      const [x, y] = center(h.id), col = ownerColor(h), mine = h.owner === "me";
-      const b = buffer(h);
-      terr += `<g class="terr-g ${selected === h.id ? "sel" : ""} ${pulseId === h.id ? "pulse" : ""}" data-hole="${h.id}">
-        <polygon points="${hexPts(x, y + 3, HEX)}" fill="rgba(40,25,10,.28)"/>
-        <polygon class="hexfill" points="${hexPts(x, y, HEX)}" fill="${col}" stroke="${h.owner ? "#fff" : "#b9a27a"}" stroke-width="2.5" ${h.owner ? "" : 'stroke-dasharray="4 3"'} stroke-linejoin="round"/>
-        <polygon points="${hexPts(x, y - 2, HEX - 5)}" fill="rgba(255,255,255,.14)" pointer-events="none"/>
-        <text x="${x}" y="${y + 3}" text-anchor="middle" font-size="15" font-weight="900" fill="${h.owner ? "#fff" : "#8a7350"}">${num(h.id)}</text>
-        <text x="${x}" y="${y + 14}" text-anchor="middle" font-size="7" font-weight="700" fill="${h.owner ? "rgba(255,255,255,.85)" : "#8a7350"}">PAR ${h.par}</text>
-        ${h.owner ? `<g><circle cx="${x + 15}" cy="${y - 15}" r="8.5" fill="#1b0f08" stroke="${b ? "#FFB13B" : "#fff"}" stroke-width="1.6"/><text x="${x + 15}" y="${y - 11.6}" text-anchor="middle" font-size="9" font-weight="800" fill="${b ? "#FFB13B" : "#fff"}">${h.troops}</text></g>` : ""}
-        ${mine ? `<path d="M${x - 17} ${y - 4}v-15" stroke="#1b0f08" stroke-width="1.8"/><path d="M${x - 17} ${y - 19}h8l-2.4 3 2.4 3h-8z" fill="#1b0f08"/>` : ""}
-        ${h.owner && !h.verified ? `<circle cx="${x - 15}" cy="${y + 13}" r="6.5" fill="#F2577A" stroke="#fff" stroke-width="1.5"/><text x="${x - 15}" y="${y + 16.5}" text-anchor="middle" font-size="9" font-weight="900" fill="#fff">!</text>` : ""}
-      </g>`;
-    }
-    const deco = `
-      <g opacity=".9"><circle cx="326" cy="84" r="22" fill="#FFB13B" opacity=".35"/><circle cx="326" cy="84" r="13" fill="#FFB13B" opacity=".8"/></g>
-      ${[[286, 120, 1], [320, 150, .8], [34, 300, .9], [328, 520, 1.1], [270, 560, .8], [110, 380, .7]].map(([x, y, s]) => `<g transform="translate(${x},${y}) scale(${s})" fill="#4f8a55"><rect x="-4" y="-22" width="8" height="24" rx="4"/><path d="M-4 -6h-5a3 3 0 0 1-3-3v-6a2.5 2.5 0 0 1 5 0v4h3zM4 -10h5a3 3 0 0 0 3-3v-5a2.5 2.5 0 0 0-5 0v3H4z"/><ellipse cx="0" cy="3" rx="10" ry="2.5" fill="rgba(90,60,30,.18)"/></g>`).join("")}
-      <g><ellipse cx="128" cy="300" rx="44" ry="20" fill="#7cc3d6"/><ellipse cx="122" cy="296" rx="30" ry="10" fill="#a5dbe8"/><path d="M98 304q8-4 16 0t16 0" stroke="#fff" stroke-width="1.6" fill="none" opacity=".7"/></g>
-      ${[[250, 470], [300, 410], [20, 220], [330, 300]].map(([x, y]) => `<ellipse cx="${x}" cy="${y}" rx="16" ry="7" fill="#F8EBD0" stroke="#e2c999" stroke-width="1.2"/>`).join("")}
-      <path d="M0 250 Q 90 230 180 252 T 366 240" stroke="rgba(180,140,90,.25)" stroke-width="1.2" fill="none"/>
-      <path d="M0 405 Q 120 385 220 410 T 366 395" stroke="rgba(180,140,90,.25)" stroke-width="1.2" fill="none"/>`;
-    if (board().kind !== "demo") return `<svg class="board" viewBox="0 0 366 608" id="board">${deco.replace(/<g opacity=".9">.*?<\/g>/, "")}${land}${bridges}${links}${terr}${veils}</svg>`;
-    return `<svg class="board" viewBox="0 0 366 608" id="board">${deco}${land}${bridges}${links}${terr}${veils}${labels}</svg>`;
-  }
-  function renderMap() {
-    const st = standings();
-    view.innerHTML = `<div class="screen">
-      <div class="map-top"><div><div class="eyebrow">Week ${S.season.week} · ${(n => n + (n === 1 ? " hole" : " holes"))(Object.values(S.holes).filter(h => h.owner === "me").length)} yours</div><h1 class="h1" style="font-size:26px;margin-top:4px">${board().kind === "demo" ? "The Map" : esc(shortName(board().name))}</h1></div>
-        <div class="top-actions"><a class="icon-btn" href="#how">${ic("help")}</a></div></div>
-      <div class="legend">${st.map(p => `<span class="chip"><span class="dot" style="background:${p.color}"></span>${p.id === "me" ? "You" : p.name} · ${p.n}</span>`).join("")}<span class="chip"><span class="dot" style="background:#E6D6B4"></span>Open</span></div>
-      <div class="board-wrap">${boardSvg()}${board().kind === "demo" ? `<div class="board-note">Demo map · fictional courses</div>` : `<div class="board-chips">${Object.values(S.courses).map(c => `<span style="background:${c.color}">${c.name.toUpperCase()} +${c.bonus}</span>`).join("")}</div><a class="board-note osm" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a>`}</div>
-      <div class="map-tip">${ic("swords")}<span>${board().kind === "demo" ? "Tap a hole. Lines = neighbors you can Challenge. Dashes = cart paths between courses." : `Built from the real ${board().name} layout. Holes that sit next to each other are neighbors. Rivals are demo players.`}</span></div>
-      <div class="board-switch"><a class="btn ghost small" href="#courses">${ic("map")}${board().kind === "demo" ? "Sync a real course" : "Change course"}</a>${board().kind !== "demo" ? `<a class="btn ghost small" href="#course">Course map</a><a class="btn primary small" href="#play">${ic("flag")}Play GPS</a>` : ""}</div>
-    </div>`;
-    view.querySelectorAll(".terr-g").forEach(g => g.addEventListener("click", () => openHole(g.dataset.hole)));
-    pulseId = null;
-  }
-
-  // ---------- HOLE SHEET ----------
-  function closeSheet() { sheetRoot.innerHTML = ""; selected = null; $("#board") && view.querySelectorAll(".terr-g.sel").forEach(g => g.classList.remove("sel")); tabbar.classList.remove("hide"); }
-  function sheet(html) {
-    sheetRoot.innerHTML = `<div class="scrim"></div><div class="sheet"><div class="grabber"></div>${html}</div>`;
-    $(".scrim", sheetRoot).onclick = () => { closeSheet(); if (location.hash.split("/").length > 1) history.replaceState(null, "", "#map"); };
-    tabbar.classList.add("hide");
-  }
-  function attackFrom(id) { return neighbors(id).map(n => S.holes[n]).filter(h => h.owner === "me" && !locked(h.id)).sort((a, b) => b.troops - a.troops); }
-
-  function openHole(id) {
-    selected = id;
-    view.querySelectorAll(".terr-g").forEach(g => g.classList.toggle("sel", g.dataset.hole === id));
-    const h = S.holes[id], c = course(id), o = h.owner && P(h.owner), mine = h.owner === "me";
-    const b = buffer(h), need = needToTake(h), from = attackFrom(id);
-    const canChallenge = h.owner && !mine && from.length > 0;
-    let needTxt;
-    if (!h.owner) needTxt = `Nobody owns it yet. <b>Any score claims it.</b>`;
-    else if (mine) needTxt = `It's yours. Rivals need a <b>${need.strokes <= 0 ? "miracle" : need.strokes + " or better"}</b> to take it${b ? ` (your ${b}-stroke fort included)` : ""}.`;
-    else needTxt = `Shoot <b>${need.strokes} or better</b> to take it.${b ? ` That's ${o.name}'s ${relTxt(rel(h))} plus a <b>${b}-stroke fort</b>.` : ` Tie goes to ${o.name}.`}`;
-    const lockedHtml = locked(id) ? `<div class="need" style="border-color:rgba(255,177,59,.6)">${c.name} is in the full season. Free covers ${freeName()} only.</div>
-      <div style="margin-top:14px"><a href="#unlock" class="btn primary block">${ic("lock")}Unlock full season · $6</a></div>` : "";
-    sheet(`<div class="hole-head">${hexSvg(ownerColor(h), num(id), { sub: "PAR " + h.par, cls: "hole-hex" })}
-        <div style="flex:1;min-width:0"><div class="eyebrow" style="color:${c.tint}">${c.name}</div><h2 class="h1">Hole ${num(id)}</h2>
-        <div class="hole-meta"><span class="chip">Par ${h.par}</span><span class="chip">${h.yards} yds</span>${S.season.stormCourse === c.id ? `<span class="chip orange">${ic("storm")}Haboob week</span>` : ""}</div></div></div>
-      <div class="owner-card">${o ? avatar(o) : `<div class="avatar" style="background:#4a3a2c">—</div>`}
-        <div class="who"><b>${o ? (mine ? "You hold it" : o.name) : "Up for grabs"}${o && !mine ? demoChip : ""}</b><span>${o ? `${o.hcp} hcp · ${h.verified ? "Partner verified ✓" : `<span style="color:#ff9db3">Unverified score</span>`}` : "First score claims it"}</span></div>
-        ${h.owner ? shieldsHtml(b) : ""}</div>
-      <div class="stat-grid">
-        <div class="stat"><span>Best</span><b>${h.strokes ?? "—"}</b><small>${h.strokes ? scoreName(h.strokes, h.par) + " · " + relTxt(rel(h)) : "No score"}</small></div>
-        <div class="stat"><span>Troops</span><b>${h.troops}</b><small>${b ? `+${b} stroke fort` : "No fort yet"}</small></div>
-        <div class="stat"><span>Fort cap</span><b>+${MAX_BUFFER}</b><small>3 troops = +1</small></div>
-      </div>
-      ${locked(id) ? lockedHtml : `<div class="need">${needTxt}</div>
-      <div class="label">Neighbors</div>
-      <div class="neighbors">${neighbors(id).map(n => { const nh = S.holes[n]; return `<span class="nb"><i style="background:${ownerColor(nh)};${nh.owner ? "" : "color:#8a7350"}">${n}</i>${nh.owner ? (nh.owner === "me" ? "You" : P(nh.owner).name) : "Open"}</span>`; }).join("")}</div>
-      <div class="sheet-actions">
-        ${mine ? `<a class="btn ghost" href="#army">${ic("shield")}Fortify</a><button class="btn primary" id="btn-post">${ic("flag")}Post score</button>`
-               : `<button class="btn ghost" id="btn-chal" ${canChallenge ? "" : "disabled"}>${ic("swords")}Challenge</button><button class="btn primary" id="btn-post">${ic("flag")}Post score</button>`}
-      </div>
-      <div class="sub">${mine ? "Beat your own best to raise the bar." : canChallenge ? `Challenge from ${from[0].id}: bring troops to cancel their fort.` : h.owner ? "Challenge needs a hole you own next door." : "Open hole. Go claim it."}</div>`}`);
-    const pb = $("#btn-post"); if (pb) pb.onclick = () => openPost(id, false);
-    const cb = $("#btn-chal"); if (cb) cb.onclick = () => openPost(id, true);
-  }
-
-  // ---------- POST SCORE ----------
-  function openPost(id, challenge, isMulligan = false) {
-    if (locked(id)) { location.hash = "#unlock"; return; }
-    const h = S.holes[id], o = h.owner && P(h.owner), me = P("me");
-    const from = challenge ? attackFrom(id)[0] : null;
-    let strokes = h.par, commit = 0, honor = true, partner = "tank";
-    const maxCommit = from ? Math.min(Math.floor((from.troops - 1) / 3), buffer(h)) * 3 : 0;
-    function verdict() {
-      const r = strokes - h.par, n = needToTake(h, commit / 3);
-      if (h.owner === "me") return r < rel(h) ? ["New personal best. Bar raised.", "#2FA36A"] : ["Doesn't beat your best. Still counts for bragging.", "#B9A58E"];
-      if (!h.owner) return ["Claims it. Easy money.", "#2FA36A"];
-      if (r < n.target) return [`Takes it from ${o.name}.`, "#2FA36A"];
-      if (r === n.target) return [`Tie. Goes to ${o.name}, defender's edge.`, "#FFB13B"];
-      return [`Not enough. Need ${n.strokes} or better.`, "#F2577A"];
-    }
-    function draw() {
-      const r = strokes - h.par, [vt, vc] = verdict(), sb = sandbagger(r, me.hcp);
-      sheet(`<div style="display:flex;align-items:center;justify-content:space-between"><div><div class="eyebrow">${isMulligan ? "Mulligan · " : ""}${challenge ? "Challenge" : "Post score"}</div><h2 class="h1" style="font-size:24px;margin-top:4px">${course(id).name} #${num(id)}</h2></div>
-          ${hexSvg(ownerColor(h), num(id), { w: 50, h: 54 })}</div>
-        <div class="muted" style="font-size:13.5px;margin-top:6px">Par ${h.par} · ${h.yards} yds · ${o ? `${h.owner === "me" ? "Your" : o.name + "'s"} best: ${h.strokes} (${relTxt(rel(h))})` : "Unclaimed"}</div>
-        <div class="stepper"><button class="step-btn" id="minus">−</button>
-          <div class="score-big"><b id="sc" style="color:${vc}">${strokes}</b><span style="color:${vc}">${scoreName(strokes, h.par)} · ${relTxt(r)}</span></div>
-          <button class="step-btn" id="plus">+</button></div>
-        <div class="verdict" style="color:${vc}">${vt}</div>
-        ${challenge && from ? `<div class="label">Bring troops from ${from.id} (has ${from.troops})</div>
-          <div class="commit">${[0, 3, 6].map(v => `<button data-c="${v}" class="${commit === v ? "on" : ""}" ${v > maxCommit ? "disabled style='opacity:.3'" : ""}>${v === 0 ? "None" : v + " troops · −" + v / 3 + " fort"}</button>`).join("")}</div>
-          <div class="sub" style="text-align:left">Win and they march in. Lose and you drop 1 troop.</div>` : ""}
-        ${sb ? `<div class="alert">${ic("alert")}<div><b>Sandbagger alert.</b> That's way under your ${me.hcp} hcp. It posts as <b>pending</b> until your partner verifies.</div></div>` : ""}
-        <div class="label">Keep it honest</div>
-        <div class="opt"><div class="txt">Honor system<small>Played it straight. No foot wedges, no gimmes.</small></div><button class="toggle ${honor ? "on" : ""}" id="honor" aria-label="Honor"></button></div>
-        <div class="opt"><div class="txt">Partner verifies<small>They get a tap to confirm. Verified scores get a ✓.</small></div>
-          <select class="partner" id="partner">${["none", ...Object.keys(S.players).filter(p => p !== "me")].map(p => `<option value="${p}" ${p === partner ? "selected" : ""}>${p === "none" ? "No partner" : P(p).name}</option>`).join("")}</select></div>
-        <div style="margin-top:16px"><button class="btn primary block" id="submit" ${honor ? "" : "disabled"}>${ic("flag")}Post ${strokes} on #${num(id)}</button></div>
-        <div class="sub">Prototype: nothing is sent to anyone. Partner verify is simulated.</div>`);
-      $("#minus").onclick = () => { if (strokes > 1) { strokes--; draw(); $("#sc").classList.add("bump"); } };
-      $("#plus").onclick = () => { if (strokes < h.par + 5) { strokes++; draw(); $("#sc").classList.add("bump"); } };
-      $("#honor").onclick = () => { honor = !honor; draw(); };
-      $("#partner").onchange = e => { partner = e.target.value; };
-      document.querySelectorAll(".commit button").forEach(btn => btn.onclick = () => { if (+btn.dataset.c <= maxCommit) { commit = +btn.dataset.c; draw(); } });
-      $("#submit").onclick = () => submit(id, strokes, { challenge, from, commit, partner, sb, isMulligan });
-    }
-    draw();
-  }
-
-  function drawCard() {
-    const r = Math.random();
-    return r < .1 ? "ace" : r < .2 ? "mull" : ["driver", "iron", "putter"][Math.floor(Math.random() * 3)];
-  }
-
-  function submit(id, strokes, o) {
-    const h = S.holes[id], prevOwner = h.owner, prevColor = ownerColor(h), prevRel = rel(h), r = strokes - h.par;
-    const verified = o.partner !== "none" && !o.sb; // flagged scores stay pending until the partner confirms
-    closeSheet();
-    if (h.owner === "me") {
-      if (r < prevRel) { h.strokes = strokes; h.verified = verified; toast(`New best on #${num(id)}: ${strokes}. Bar raised.`); } else toast("Logged. Your best still stands.");
-      save(); route(); return;
-    }
-    const n = needToTake(h, o.commit / 3);
-    const win = !h.owner || r < n.target;
-    if (win) {
-      h.owner = "me"; h.strokes = strokes; h.verified = verified;
-      h.troops = o.challenge && o.commit ? o.commit : 1;
-      if (o.challenge && o.commit) o.from.troops -= o.commit;
-      let card = null;
-      if (!S.capturedThisWeek) { card = drawCard(); if (card === "mull") S.mulligans++; else S.cards.push(card); S.capturedThisWeek = true; }
-      S.feed.unshift({ t: "now", icon: "flag", text: `<b>You</b> took <b>${id}</b> ${prevOwner ? `from ${P(prevOwner).name} ` : ""}with ${/^[AEIOU]/.test(scoreName(strokes, h.par)) ? "an" : "a"} ${scoreName(strokes, h.par).toLowerCase()}.` });
-      if (o.sb) S.feed.unshift({ t: "now", icon: "alert", text: `<b>Sandbagger alert</b> on your ${id}. Pending partner verify.` });
-      save();
-      showCapture(id, prevOwner, prevColor, prevRel, strokes, card, o);
-    } else {
-      if (o.challenge && o.from) o.from.troops = Math.max(1, o.from.troops - 1);
-      save();
-      showMiss(id, strokes, o);
-    }
-  }
-
-  function confetti(n = 46) {
-    const cols = ["#FF6A2B", "#FFB13B", "#F3E2C2", "#2FA36A", "#F2577A", "#fff"];
-    return Array.from({ length: n }, (_, i) => `<i class="confetti" style="left:${Math.random() * 100}%;background:${cols[i % cols.length]};animation-duration:${2.2 + Math.random() * 1.8}s;animation-delay:${1.2 + Math.random() * .8}s;transform:rotate(${Math.random() * 180}deg)"></i>`).join("");
-  }
-  function showCapture(id, prevOwner, prevColor, prevRel, strokes, card, o) {
-    const h = S.holes[id], c = course(id), held = courseCount("me", c.id), tot = Object.keys(S.holes).filter(x => x[0] === c.id).length, full = held === tot;
-    const prevName = prevOwner ? P(prevOwner).name : null;
-    const line = prevOwner ? `${scoreName(strokes, h.par)} beats ${prevName}'s ${relTxt(prevRel)}. ${prevName} is gonna hear about this.` : `Fresh flag on open ground. Nobody's touching it yet.`;
-    overlayRoot.innerHTML = `<div class="capture" style="--cap-glow:rgba(255,106,43,.55)"><div class="cap-rays"></div>${confetti()}
-      <div class="cap-hex"><div class="face front">${hexSvg(prevColor, num(id), { w: 190, h: 205, sub: "PAR " + h.par })}</div><div class="face back">${hexSvg(P("me").color, num(id), { w: 190, h: 205, sub: "PAR " + h.par })}</div>
-        <svg class="cap-flag" viewBox="0 0 70 110"><path d="M8 108V6" stroke="#FFF6E8" stroke-width="5" stroke-linecap="round"/><path d="M10 8h50l-12 15 12 15H10z" fill="#FFF6E8"/><circle cx="8" cy="6" r="5" fill="#FFB13B"/></svg></div>
-      <h1 class="cap-title">HOLE ${num(id)}<br><em>TAKEN.</em></h1>
-      <p class="cap-sub">${line}</p>
-      <div class="cap-rewards"><span class="chip orange">${c.name} ${held}/${tot}</span>${card ? `<span class="chip green">+1 card: ${CARD_NAMES[card]}</span>` : ""}${o.commit ? `<span class="chip">${o.commit} troops moved in</span>` : ""}${o.sb ? `<span class="chip" style="color:#ff9db3">Pending verify</span>` : ""}${full ? `<span class="chip green">Course bonus +${c.bonus}/wk</span>` : ""}</div>
-      <div class="cap-actions"><button class="btn primary block" id="cap-ok">Back to the map</button><button class="btn ghost block" id="cap-share">${ic("share")}Share the W</button></div></div>`;
-    $("#cap-ok").onclick = () => { overlayRoot.innerHTML = ""; pulseId = id; const back = o.returnTo || "#map"; if (location.hash !== back) location.hash = back; else route(); };
-    $("#cap-share").onclick = () => toast("Share sheet goes here (placeholder, nothing posted).");
-  }
-  function showMiss(id, strokes, o) {
-    const h = S.holes[id], ow = P(h.owner);
-    overlayRoot.innerHTML = `<div class="capture miss" style="--cap-glow:${ow.color}55">
-      <div class="cap-hex" style="width:150px;height:162px"><div class="face">${hexSvg(ow.color, num(id), { w: 150, h: 162, sub: "PAR " + h.par })}</div></div>
-      <h1 class="cap-title" style="animation-delay:.1s">HELD.</h1>
-      <p class="cap-sub" style="animation-delay:.25s">${strokes} wasn't enough. ${ow.name}'s ${relTxt(rel(h))}${buffer(h) ? ` plus the fort` : ""} holds. ${o.challenge ? "You lost 1 troop on the charge." : ""}</p>
-      <div class="cap-actions" style="animation-delay:.4s;margin-top:24px">${S.mulligans > 0 && !o.isMulligan ? `<button class="btn primary block" id="mull">${ic("redo")}Use a Mulligan (${S.mulligans} left)</button>` : ""}<button class="btn ghost block" id="miss-ok">Back to the map</button></div></div>`;
-    const m = $("#mull"); if (m) m.onclick = () => { if (!S.unlocked) { overlayRoot.innerHTML = ""; location.hash = "#unlock"; return; } S.mulligans--; if (S.round[S.active]) delete S.round[S.active][id]; save(); overlayRoot.innerHTML = ""; if (o.returnTo === "#play") { location.hash = "#play"; toast("Mulligan used. Re-post the hole."); } else openPost(id, o.challenge, true); };
-    $("#miss-ok").onclick = () => { overlayRoot.innerHTML = ""; if (o.returnTo && location.hash !== o.returnTo) location.hash = o.returnTo; else route(); };
-  }
-
-  // ---------- ARMY (troops + cards) ----------
-  let selCards = new Set();
-  function validSet(types) {
-    if (types.length !== 3) return false;
-    const real = types.filter(t => t !== "ace"), u = new Set(real);
-    return u.size <= 1 || u.size === real.length;
-  }
-  function renderArmy() {
-    const inc = income(), mine = Object.values(S.holes).filter(h => h.owner === "me").sort((a, b) => a.id.localeCompare(b.id));
-    const types = [...selCards].map(i => S.cards[i]), ok = validSet(types);
-    view.innerHTML = `<div class="screen">
-      <div class="map-top"><div><div class="eyebrow">Week ${S.season.week}</div><h1 class="h1" style="font-size:26px;margin-top:4px">Troops & Cards</h1></div><a class="icon-btn" href="#how">${ic("help")}</a></div>
-      <section class="troop-hero"><div class="num" id="pool">${S.myTroops}</div><div class="lbl">troops ready<small>Drop them on your holes.<br>3 troops = +1 stroke of defense.</small></div>
-        <svg class="soldiers" viewBox="0 0 120 100"><g fill="#1b0f08">${[[20, 40], [55, 30], [90, 40]].map(([x, y]) => `<circle cx="${x}" cy="${y}" r="10"/><path d="M${x - 14} ${y + 50}q0-34 14-34t14 34z"/>`).join("")}</g></svg></section>
-      <div class="income"><div class="income-row total" style="border:0;margin:0;padding:0 0 2px"><span>Next week's troops</span><b>+${inc.total}</b></div>
-        <div class="sets" style="margin-top:8px"><span class="chip">${inc.n} holes ÷ 3 · +${inc.base}</span>${Object.values(S.courses).map(c => { const full = continentsOf("me").includes(c.id); return `<span class="chip ${full ? "green" : ""}">${c.abbr || c.name.split(" ")[0]} ${courseCount("me", c.id)}/${Object.keys(S.holes).filter(x => x[0] === c.id).length} · ${full ? "+" + c.bonus : "<span style='opacity:.55'>+" + c.bonus + "</span>"}</span>`; }).join("")}</div></div>
-      <div class="section-head"><h2 class="h2">Your hand</h2><span class="muted" style="font-size:12px">${S.cards.length} cards · ${S.mulligans} Mulligan</span></div>
-      <div class="hand">${S.cards.map((t, i) => cardHtml(t, i, selCards.has(i))).join("")}${Array.from({ length: S.mulligans }, () => cardHtml("mull", -1, false)).join("")}</div>
-      <div class="trade-box"><div class="row2"><p>${selCards.size === 0 ? "Pick 3: three of a kind or one of each. Ace is wild." : ok ? `<b style="color:#A8E8C4">Valid set.</b> Cash it in.` : selCards.size < 3 ? `${3 - selCards.size} more to go.` : `<b style="color:#ff9db3">Not a set.</b> Same, or all different.`}</p>
-        <button class="btn primary small" id="trade" ${ok ? "" : "disabled"}>${!S.unlocked ? ic("lock") : ""}Trade +${nextSetValue()}</button></div>
-        <div class="sub" style="text-align:left;margin-top:8px">3× same or 1 of each · Ace is wild · sets climb 4, 6, 8, 10…</div></div>
-      <div class="section-head"><h2 class="h2">Fortify</h2><span class="muted" style="font-size:12px">Max ${MAX_TROOPS} per hole</span></div>
-      <div class="fort-list">${mine.map(h => `<div class="fort"><div class="mini">${hexSvg(P("me").color, num(h.id), { w: 40, h: 44 })}</div>
-          <div class="who"><b>${course(h.id).name} #${num(h.id)}</b><span>Best ${h.strokes} (${relTxt(rel(h))}) · ${shieldsHtml(buffer(h))}</span></div>
-          <div class="fort-ctl"><button data-m="${h.id}" ${h.troops <= 1 ? "disabled" : ""}>−</button><output>${h.troops}</output><button class="plus" data-p="${h.id}" ${S.myTroops < 1 || h.troops >= MAX_TROOPS ? "disabled" : ""}>+</button></div></div>`).join("")}</div>
-      <div style="margin:16px"><button class="btn ghost block" id="nextweek">${ic("sun")}Sim next week (demo)</button><div class="sub">Pays out troops, rolls the Haboob, demo crew makes moves.</div></div>
-    </div>`;
-    view.querySelectorAll(".gcard[data-card]").forEach(b => b.onclick = () => {
-      const i = +b.dataset.card; if (i < 0) { toast("Mulligan: use it after a missed post to re-post that hole."); return; }
-      selCards.has(i) ? selCards.delete(i) : selCards.size < 3 && selCards.add(i); renderArmy(); });
-    view.querySelectorAll("[data-p]").forEach(b => b.onclick = () => { const h = S.holes[b.dataset.p]; if (S.myTroops > 0 && h.troops < MAX_TROOPS) { h.troops++; S.myTroops--; save(); renderArmy(); if (h.troops % 3 === 0) toast(`#${num(h.id)} fort is now +${buffer(h)} stroke${buffer(h) > 1 ? "s" : ""}.`); } });
-    view.querySelectorAll("[data-m]").forEach(b => b.onclick = () => { const h = S.holes[b.dataset.m]; if (h.troops > 1) { h.troops--; S.myTroops++; save(); renderArmy(); } });
-    $("#trade").onclick = () => {
-      if (!S.unlocked) { location.hash = "#unlock"; return; }
-      const v = nextSetValue(); S.cards = S.cards.filter((_, i) => !selCards.has(i)); selCards.clear(); S.tradeCount++; S.myTroops += v; save(); renderArmy(); toast(`Set cashed. +${v} troops.`);
-    };
-    $("#nextweek").onclick = nextWeek;
-  }
-
-  function nextWeek() {
-    if (S.season.week >= S.season.weeks) { const w = standings()[0]; toast(`Season over. ${w.id === "me" ? "You win" : w.name + " wins"} with ${w.n} holes.`); return; }
-    const inc = income();
-    S.season.week++; S.myTroops += inc.total; S.capturedThisWeek = false;
-    const stormC = S.season.stormCourse;
-    Object.values(S.holes).filter(h => h.id[0] === stormC).forEach(h => { if (h.owner) h.troops = 1; });
-    const others = Object.keys(S.courses).filter(c => c !== stormC), nextStorm = others.length ? others[Math.floor(Math.random() * others.length)] : stormC;
-    S.season.stormCourse = nextStorm;
-    // demo crew makes one move: grab a random neighbor of something they hold
-    const bots = Object.keys(S.players).filter(p => p !== "me"), bot = bots[Math.floor(Math.random() * bots.length)];
-    const targets = Object.values(S.holes).filter(h => h.owner !== bot && h.owner !== "me" && neighbors(h.id).some(n => S.holes[n].owner === bot));
-    if (targets.length) { const t = targets[Math.floor(Math.random() * targets.length)]; t.owner = bot; t.strokes = t.par - 1; t.troops = 1; t.verified = true;
-      S.feed.unshift({ t: "now", icon: "flag", text: `<b>${P(bot).name}</b> birdied <b>${t.id}</b> and took it.` }); }
-    S.feed.unshift({ t: "now", icon: "storm", text: `Haboob cleared ${S.courses[stormC].name}. Next one's headed for <b>${S.courses[nextStorm].name}</b>.` });
-    save(); renderArmy(); toast(`Week ${S.season.week}. +${inc.total} troops. Haboob reset ${S.courses[stormC].name}.`);
-  }
-
-  // ---------- RANKS ----------
-  let rankTab = "season";
-  function renderRanks() {
-    const st = standings(), top = [st[1], st[0], st[2]];
-    const seasonLocked = !S.unlocked && rankTab === "season";
-    const rowsFor = list => list.map((p, i) => `<div class="row ${p.id === "me" ? "me" : ""}"><div class="pos">${i + 1}</div>${avatar(p)}
-      <div class="who"><b>${p.name}<span class="badges">${(p.conts || []).map(c => `<span class="cbadge" style="background:${S.courses[c].color}">${S.courses[c].name.split(" ")[0].toUpperCase()}</span>`).join("")}</span></b>
-      <span>${p.hcp} hcp · ${Object.values(S.courses).map(c => `${c.abbr || c.name.slice(0, 3).toUpperCase()} ${courseCount(p.id, c.id)}`).join(" · ")}</span></div>
-      <div class="terr"><b>${p.n}</b><span>holes</span></div></div>`).join("");
-    const fc = freeCourse().id; const courseList = st.map(p => ({ ...p, n: courseCount(p.id, fc), conts: continentsOf(p.id).filter(c => c === fc) })).sort((a, b) => b.n - a.n);
-    view.innerHTML = `<div class="screen">
-      <div class="map-top"><div><div class="eyebrow">Week ${S.season.week} of ${S.season.weeks}</div><h1 class="h1" style="font-size:26px;margin-top:4px">Leaderboard</h1></div>${demoChip}</div>
-      <div class="podium">${top.map((p, i) => `<div class="pod ${["second", "first", "third"][i]}">${avatar(p)}<div class="nm">${p.name}</div><div class="block" style="animation-delay:${[120, 0, 220][i]}ms">${p.n}<small>holes</small></div></div>`).join("")}</div>
-      <div class="seg"><button data-t="season" class="${rankTab === "season" ? "on" : ""}">Season${S.unlocked ? "" : " 🔒"}</button><button data-t="course" class="${rankTab === "course" ? "on" : ""}">${freeName()}</button></div>
-      ${seasonLocked ? `<div class="locked-rows"><div class="standings rows-blur">${rowsFor(st)}</div><div class="lock-cta"><div><b>Full season board is in the $6 unlock.</b><br><a class="link" href="#unlock">See what's in it →</a></div></div></div>`
-        : `<div class="standings">${rowsFor(rankTab === "season" ? st : courseList)}</div>`}
-      <div class="section-head"><h2 class="h2">How you win</h2></div>
-      <div class="rules"><div class="rule"><div class="rule-ic" style="background:rgba(255,177,59,.15);color:#FFB13B">${ic("trophy", "#FFB13B").replace("<svg", '<svg width="22" height="22"')}</div><div><h3>Most holes after week ${S.season.weeks}</h3><p>Or own all ${Object.keys(S.holes).length} holes for an instant Grand Slam.</p></div></div></div>
-    </div>`;
-    view.querySelectorAll(".seg button").forEach(b => b.onclick = () => { rankTab = b.dataset.t; renderRanks(); });
-  }
-
-  // ---------- HOW TO PLAY ----------
-  function renderHow() {
-    const rules = [
-      ["1", "#FF6A2B", "Holes are territory", "Each hole is a territory. Each course is a continent. Lowest score vs par owns it."],
-      ["2", "#2FA36A", "Beat it to take it", "Post a strictly lower score than the holder. Ties go to the defender."],
-      ["3", "#FFB13B", "Troops = defense", "Every week you get troops: holes ÷ 3 (min 3), plus a bonus for each full course. Every 3 troops on a hole adds +1 stroke of defense, max +2."],
-      ["4", "#7A4DFF", "Cards", "Take at least one hole in a week, draw a card. Trade 3 (same, or one of each, Ace wild) for troops. Sets climb: 4, 6, 8, 10…"],
-      ["5", "#E5489A", "Win the season", `Most holes after ${S.season.weeks} weeks wins. Own every course and it's over early.`]
-    ];
-    const tw = [
-      ["swords", "#FF6A2B", "Challenge", "Hit a neighbor of a hole you own. Bring troops to cancel their fort."],
-      ["storm", "#E7CFA4", "Haboob", "Weekly dust storm. One course's forts reset to 1."],
-      ["redo", "#8a63ff", "Mulligan", "Power-up card. Re-post one hole after a miss."],
-      ["alert", "#F2577A", "Sandbagger alert", "Score way under your handicap? It's pending until verified."],
-      ["check", "#2FA36A", "Honor + verify", "Honor system by default. Partner taps to verify for a ✓."],
-      ["lock", "#FFB13B", "Free vs $6", "Free: GPS on every hole + the front 9 game. $6 unlocks everything."],
-      ["map", "#2F6BFF", "Any real course", "Sync a course from OpenStreetMap. GPS finds your hole and gives you yardages."]
-    ];
-    view.innerHTML = `<div class="screen">
-      <div class="map-top"><div><div class="eyebrow">30-second version</div><h1 class="h1" style="font-size:26px;margin-top:4px">How to play</h1></div><a class="icon-btn" href="#home">${ic("close")}</a></div>
-      <div class="rules" style="margin-top:10px">${rules.map(([n, c, t, d]) => `<div class="rule"><div class="rule-ic" style="background:${c}22;color:${c}">${n}</div><div><h3>${t}</h3><p>${d}</p></div></div>`).join("")}</div>
-      <div class="section-head"><h2 class="h2">The twists</h2></div>
-      <div class="twists">${tw.map(([i, c, t, d]) => `<div class="twist"><div class="t-ic" style="background:${c}22">${ic(i, c)}</div><b>${t}</b><p>${d}</p></div>`).join("")}</div>
-      <div style="margin:18px 16px 0;display:grid;gap:10px"><a class="btn primary block" href="#map">Got it. Show me the map</a><button class="btn ghost block" id="reset">Reset demo data</button></div>
-      <p class="fineprint">Fairway Conquest is a working title. Inspired by classic territory-conquest board games. Demo players and scores are made up. Real course maps: © OpenStreetMap contributors (ODbL).</p>
-    </div>`;
-    $("#reset").onclick = () => { localStorage.removeItem(KEY); S = fresh(); S.onboarded = true; save(); toast("Demo data reset."); };
-  }
-
-  // ---------- UNLOCK (paywall placeholder) ----------
-  function renderUnlock() {
-    const perks = [
-      ["map", "#FF6A2B", "All 18, every course", "Back 9 territory on any synced course, plus the full demo board."],
-      ["cards", "#8a63ff", "Cards & power-ups", "Trade-ins, Aces and Mulligans."],
-      ["trophy", "#FFB13B", "Season leaderboard", "The full 8-week race, plus the Grand Slam."]
-    ];
-    overlayRoot.innerHTML = `<div class="unlock"><button class="icon-btn unlock-close" id="ul-close" aria-label="Close">${ic("close")}</button>
-      <div class="unlock-art"><svg viewBox="0 0 290 230">
-        ${[[90, 120, "#1F7A4D"], [145, 88, "#FF6A2B"], [200, 120, "#33546E"], [145, 152, "#B5532A"], [90, 184, "#F3E2C2"], [200, 184, "#FFB13B"]].map(([x, y, c], i) => `<polygon points="${hexPts(x, y, 34)}" fill="${c}" stroke="rgba(255,255,255,.85)" stroke-width="3" opacity="${i === 1 ? 1 : .92}"/>`).join("")}
-        <path d="M145 80V40" stroke="#FFF6E8" stroke-width="4" stroke-linecap="round"/><path d="M147 41h30l-8 10 8 10h-30z" fill="#FFF6E8"/>
-        <g transform="translate(118,130)"><rect width="54" height="44" rx="12" fill="#1b0f08" stroke="#FFB13B" stroke-width="2.5"/><path d="M15 16V11a12 12 0 0 1 24 0v5" stroke="#FFB13B" stroke-width="4" fill="none" stroke-linecap="round" transform="translate(0,-14)"/><circle cx="27" cy="22" r="5" fill="#FFB13B"/></g></svg></div>
-      <div class="unlock-body"><div class="eyebrow">Full season</div><h1 class="h1">Run the whole desert.</h1>
-        <div class="muted" style="font-size:15px">GPS and the front 9 are free. Want the whole thing?</div>
-        <div class="price"><b>$6</b><span>one time · no subscription</span></div>
-        <div class="perks">${perks.map(([i, c, t, d]) => `<div class="perk"><div class="pk-ic" style="background:${c}22">${ic(i, c)}</div><div>${t}<small>${d}</small></div></div>`).join("")}</div>
-        <button class="btn primary block" id="ul-buy">Unlock full season · $6</button>
-        <div class="placeholder-tag"><b>Placeholder button.</b> Charges nothing and calls no payment service. The real version would use App Store / Google Play in-app purchase.</div>
-        <button class="btn ghost block" id="ul-preview" style="margin-top:12px">${S.unlocked ? "Back to free demo (prototype)" : "Preview unlocked (prototype only)"}</button>
-        <div class="free-vs"><div><b>FREE</b>Course sync + GPS yardages<br>Front 9 territory game<br>Demo: Saguaro Flats<br>Course leaderboard</div>
-          <div class="paid"><b>$6 UNLOCK</b>All 18 on every course<br>Cards, trade-ins, Mulligans<br>Season leaderboard<br>Grand Slam win</div></div>
-        <div class="sub">Restore purchase · Terms · Privacy (placeholders)</div></div></div>`;
-    tabbar.classList.add("hide");
-    const close = () => { overlayRoot.innerHTML = ""; tabbar.classList.remove("hide"); history.length > 1 ? history.back() : (location.hash = "#home"); };
-    $("#ul-close").onclick = close;
-    $("#ul-buy").onclick = () => toast("Placeholder. No charge. In-app purchase hooks in here later.");
-    $("#ul-preview").onclick = () => { S.unlocked = !S.unlocked; save(); overlayRoot.innerHTML = ""; tabbar.classList.remove("hide"); location.hash = "#map"; toast(S.unlocked ? "Preview mode: everything unlocked. Still $0." : "Back to the free demo."); };
-  }
-
-  // =====================================================================
-  //  v2: real courses (OpenStreetMap), course map, GPS on-course mode
-  // =====================================================================
-  const esc = t => String(t ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
-  const shortName = n => String(n).replace(/\s*(Golf Club|Golf Course|Country Club|Golf Resort)\b/i, "").replace(/\s+·\s+/, " · ");
-  const freeCourse = () => Object.values(S.courses).find(c => c.free) || Object.values(S.courses)[0];
-  const freeName = () => freeCourse().name;
-  const yd = m => m == null ? "—" : Math.round(m / 0.9144);
+  // ---------- courses & boards ----------
   const COURSE_KEY = "fc.course.";
   const memCourses = {};
   function saveCourse(c) { memCourses[c.key] = c; try { localStorage.setItem(COURSE_KEY + c.key, JSON.stringify(c)); } catch (e) { toast("Phone storage is full. Course kept for this session only."); } }
@@ -596,15 +83,6 @@
     try { const c = JSON.parse(localStorage.getItem(COURSE_KEY + key)); if (c) return memCourses[key] = c; } catch (e) {}
     return null;
   }
-  function rng(seedStr) { let h = 1779033703 ^ seedStr.length; for (let i = 0; i < seedStr.length; i++) { h = Math.imul(h ^ seedStr.charCodeAt(i), 3432918353); h = h << 13 | h >>> 19; }
-    return () => { h = Math.imul(h ^ h >>> 16, 2246822507); h = Math.imul(h ^ h >>> 13, 3266489909); return ((h ^= h >>> 16) >>> 0) / 4294967296; }; }
-
-  const NINES = [
-    { id: "F", name: "Front 9", abbr: "F9", color: "#1F7A4D", tint: "#BFE3B4", bonus: 3, free: true },
-    { id: "B", name: "Back 9", abbr: "B9", color: "#B5532A", tint: "#F4C79E", bonus: 3, free: false },
-    { id: "T", name: "Third 9", abbr: "T9", color: "#33546E", tint: "#B9D3E0", bonus: 3, free: false }
-  ];
-  const nineOf = ref => ref <= 9 ? NINES[0] : ref <= 18 ? NINES[1] : NINES[2];
 
   /** Lay real holes onto a hex board that keeps the course's real geography. */
   function hexLayout(points) {
@@ -635,10 +113,11 @@
     return out;
   }
 
+
+  /** A board = one playable loop of a course: holes with par, yards and a hex position that keeps the real geography. */
   function buildBoard(course, loopId, manualCount) {
     const loop = course.loops.find(l => l.id === loopId) || course.loops[0];
-    const key = course.key + "#" + (loop ? loop.id : "manual");
-    const prev = S.boards[key];
+    const key = course.key + "#" + (loop ? loop.id : "manual" + manualCount);
     let holesSrc, pts;
     if (loop) {
       const pj = OSM.projector(course.center[0], course.center[1]);
@@ -648,50 +127,399 @@
       holesSrc = Array.from({ length: manualCount }, (_, i) => ({ ref: i + 1, par: 4, yards: null }));
       pts = holesSrc.map((h, i) => { const nine = Math.floor(i / 9), k = i % 9, row = Math.floor(k / 3), col = row % 2 ? 2 - k % 3 : k % 3; return [col * 90 + nine * 140, -(row * 80 + nine * 260)]; });
     }
-    const pos = hexLayout(pts);
-    const r = rng(key), bots = Object.keys(S.players).filter(p => p !== "me");
-    const holes = {}, courses = {};
-    holesSrc.forEach((h, i) => {
-      const n = nineOf(h.ref), id = n.id + h.ref;
-      courses[n.id] = { ...n, name: n.name };
-      const old = prev && prev.holes[id];
-      if (old) { holes[id] = { ...old, par: h.par, yards: h.yards, pos: pos[i], ref: h.ref }; return; }
-      const owned = r() < 0.6, bot = bots[Math.floor(r() * bots.length)];
-      const d = [-1, 0, 0, 1, 1, 2][Math.floor(r() * 6)];
-      holes[id] = { id, ref: h.ref, par: h.par, yards: h.yards, pos: pos[i], owner: owned ? bot : null, strokes: owned ? h.par + d : null, troops: owned ? 1 + Math.floor(r() * 3) : 0, verified: r() > 0.12 };
-    });
-    const ids = Object.keys(holes).sort((a, b) => holes[a].ref - holes[b].ref);
-    const touching = (a, b) => Math.hypot(holes[a].pos[0] - holes[b].pos[0], holes[a].pos[1] - holes[b].pos[1]) < SQ3 * R * 1.1;
-    const bridges = [];
-    for (let i = 1; i < ids.length; i++) if (!touching(ids[i - 1], ids[i])) bridges.push([ids[i - 1], ids[i]]);
+    const pos = hexLayout(pts), holes = {};
+    holesSrc.forEach((h, i) => { const id = "H" + h.ref; holes[id] = { id, ref: h.ref, par: h.par, yards: h.yards, pos: pos[i] }; });
     const name = course.name + (loop && course.loops.length > 1 ? " · " + loop.name : "");
-    S.boards[key] = { key, kind: loop ? "osm" : "manual", name, courseKey: course.key, loopId: loop ? loop.id : null, courses, holes, bridges, storm: courses.B ? "B" : "F", demoRivals: true };
-    S.active = key; adjCache = { key: null };
-    S.season.stormCourse = S.boards[key].storm;
+    S.boards[key] = { key, kind: loop ? "osm" : "manual", name, area: course.area || "", courseKey: course.key, loopId: loop ? loop.id : null, holes };
     save();
     return S.boards[key];
   }
+  const holeIds = b => Object.keys(b.holes).sort((x, y) => b.holes[x].ref - b.holes[y].ref);
+  const parOf = b => holeIds(b).reduce((a, id) => a + b.holes[id].par, 0);
+  function adjacency(b) {
+    const ids = Object.keys(b.holes), A = {}; ids.forEach(a => A[a] = []);
+    for (const a of ids) for (const c of ids) if (a < c) {
+      const [x1, y1] = b.holes[a].pos, [x2, y2] = b.holes[c].pos;
+      if (Math.hypot(x1 - x2, y1 - y2) < SQ3 * R * 1.1) { A[a].push(c); A[c].push(a); }
+    }
+    return A;
+  }
 
-  // ---------- course search ----------
+  // ---------- match engine ----------
+  const M = () => S.match;
+  const mBoard = (m = M()) => m && S.boards[m.boardKey];
+  const mHoles = (m = M()) => m ? m.holes : [];
+  /** Replays the match from the score log. Pure: ownership, events, ledger and standings are always derived, so editing a hole just works. */
+  function resolve(m = M()) {
+    const b = mBoard(m), adj = adjacency(b), owner = {}, how = {}, events = [], ledger = [];
+    const ids = m.players.map(p => p.id);
+    for (const hid of m.log) {
+      const sc = m.scores[hid]; if (!sc) continue;
+      const vals = ids.map(p => sc[p]).filter(v => v != null); if (vals.length < ids.length) continue;
+      const best = Math.min(...vals), winners = ids.filter(p => sc[p] === best);
+      const ev = { hole: hid, best, scores: sc };
+      if (winners.length > 1) { ev.tie = true; events.push(ev); continue; }
+      const w = winners[0], second = Math.min(...ids.filter(p => p !== w).map(p => sc[p]));
+      ev.winner = w; ev.margin = second - best;
+      if (owner[hid] && owner[hid] !== w) ev.retook = owner[hid];
+      owner[hid] = w; how[hid] = "won";
+      if (ev.margin >= 2) {
+        const target = (adj[hid] || []).filter(n => owner[n] && owner[n] !== w).sort((x, y) => b.holes[x].ref - b.holes[y].ref)[0];
+        if (target) { ev.steal = target; ev.stoleFrom = owner[target]; owner[target] = w; how[target] = "stolen"; }
+      }
+      if (m.stake.type === "hole" || m.stake.type === "both") ids.filter(p => p !== w).forEach(p => ledger.push({ hole: hid, from: p, to: w, amt: m.stake.hole }));
+      events.push(ev);
+    }
+    const strokes = {}, played = m.log.filter(h => m.scores[h] && ids.every(p => m.scores[h][p] != null));
+    ids.forEach(p => strokes[p] = played.reduce((a, h) => a + m.scores[h][p], 0));
+    const par = played.reduce((a, h) => a + b.holes[h].par, 0);
+    const count = {}; ids.forEach(p => count[p] = 0); Object.values(owner).forEach(p => count[p]++);
+    const steals = {}; ids.forEach(p => steals[p] = events.filter(e => e.steal && e.winner === p).length);
+    const table = m.players.map(p => ({ ...p, holes: count[p.id], strokes: strokes[p.id], toPar: strokes[p.id] - par, steals: steals[p.id] }))
+      .sort((x, y) => y.holes - x.holes || x.strokes - y.strokes);
+    const leader = table.length > 1 && (table[0].holes > table[1].holes || (table[0].holes === table[1].holes && table[0].strokes < table[1].strokes)) ? table[0] : null;
+    const complete = played.length === m.holes.length;
+    if (complete && leader && (m.stake.type === "match" || m.stake.type === "both")) ids.filter(p => p !== leader.id).forEach(p => ledger.push({ hole: "match", from: p, to: leader.id, amt: m.stake.match }));
+    const net = {}; ids.forEach(p => net[p] = 0); ledger.forEach(l => { net[l.from] -= l.amt; net[l.to] += l.amt; });
+    return { owner, how, events, ledger, net, table, leader, played, complete, par, adj };
+  }
+  /** Fewest payments to square up (works for 2-4 players). */
+  function settle(net) {
+    const cred = Object.entries(net).filter(([, v]) => v > 0).map(([p, v]) => [p, v]), debt = Object.entries(net).filter(([, v]) => v < 0).map(([p, v]) => [p, -v]);
+    const out = [];
+    for (const d of debt) for (const c of cred) { if (d[1] <= 0) break; const x = Math.min(d[1], c[1]); if (x > 0) { out.push({ from: d[0], to: c[0], amt: x }); d[1] -= x; c[1] -= x; } }
+    return out;
+  }
+  const pl = id => M().players.find(p => p.id === id);
+  const nextOpen = m => m.holes.find(h => !(m.scores[h] && m.players.every(p => m.scores[h][p.id] != null)));
+  function newMatch(d) {
+    const b = S.boards[d.boardKey];
+    let holes = holeIds(b);
+    if (d.range === "front") holes = holes.filter(h => b.holes[h].ref <= 9); else if (d.range === "back") holes = holes.filter(h => b.holes[h].ref > 9);
+    const code = Array.from({ length: 4 }, () => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[Math.floor(Math.random() * 32)]).join("");
+    S.match = { id: Date.now().toString(36), code, created: Date.now(), boardKey: b.key, holes, mode: d.mode,
+      players: d.players.map((p, i) => ({ id: "p" + (i + 1), name: (p.name || "").trim() || (i ? "Player " + (i + 1) : "You"), color: COLORS[i], ink: INK[i] })),
+      stake: { ...d.stake }, scores: {}, st: {}, fs: {}, seats: { p1: S.dev }, log: [], cur: holes[0], done: false };
+    if (d.mode === "invite") S.match.net = { role: "host", hostId: `fcq-${S.match.id}-${code.toLowerCase()}`, myPid: "p1" };
+    playEdit = null; save();
+  }
+
+  // ---------- territory board (hex) ----------
+  let hbN = 0;
+  /** Risk-style board: each hole a hex in real-course geography. Owned hexes glow in the owner's color over a desert-course backdrop (set in CSS). */
+  function hexBoard(m, o = {}) {
+    const b = mBoard(m), r = resolve(m), ids = m.holes, fid = "hg" + (++hbN);
+    const P = ids.map(id => b.holes[id].pos);
+    let bb = P.reduce((a, [x, y]) => [Math.min(a[0], x), Math.min(a[1], y), Math.max(a[2], x), Math.max(a[3], y)], [Infinity, Infinity, -Infinity, -Infinity]);
+    const pad = HEX + 10; bb = [bb[0] - pad, bb[1] - pad, bb[2] + pad, bb[3] + pad];
+    const route = ids.map(id => b.holes[id].pos.join(",")).join(" ");
+    let s = `<defs><filter id="${fid}" x="-60%" y="-60%" width="220%" height="220%"><feGaussianBlur stdDeviation="3.2" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>`;
+    s += `<polyline points="${route}" fill="none" stroke="rgba(255,255,255,.22)" stroke-width="1.6" stroke-dasharray="1 5" stroke-linecap="round"/>`;
+    ids.forEach(id => {
+      const h = b.holes[id], [x, y] = h.pos, own = r.owner[id], p = own && pl(own), cur = !o.noCur && id === m.cur && !m.done;
+      s += `<g class="hx ${cur ? "cur" : ""} ${p ? "own" : "open"}" data-hx="${id}">
+        ${cur ? `<polygon class="hx-ring" points="${hexPts(x, y, HEX + 4)}" fill="none" stroke="#fff" stroke-width="2.2" stroke-linejoin="round"/>` : ""}
+        ${p ? `<polygon points="${hexPts(x, y, HEX - 1)}" fill="${p.color}" fill-opacity=".34" stroke="${p.color}" stroke-width="2.6" stroke-linejoin="round" filter="url(#${fid})"/>`
+            : `<polygon points="${hexPts(x, y, HEX - 1)}" fill="rgba(4,8,6,.55)" stroke="rgba(255,255,255,.38)" stroke-width="1.4" stroke-dasharray="3 3" stroke-linejoin="round"/>`}
+        <text x="${x}" y="${y + 6}" text-anchor="middle" font-size="18" font-weight="800" font-style="italic" fill="${p ? "#fff" : "rgba(255,255,255,.75)"}" stroke="rgba(0,0,0,.55)" stroke-width="3" paint-order="stroke">${h.ref}</text>
+        ${r.how[id] === "stolen" ? `<circle cx="${x + 14}" cy="${y - 14}" r="6.5" fill="#050706" stroke="${p.color}" stroke-width="1.6"/><path d="M${x + 11.5} ${y - 14}h5M${x + 14.5} ${y - 16.5}l2.2 2.5-2.2 2.5" stroke="${p.color}" stroke-width="1.5" fill="none" stroke-linecap="round"/>` : ""}</g>`;
+    });
+    return `<svg class="hexboard" viewBox="${bb[0]} ${bb[1]} ${bb[2] - bb[0]} ${bb[3] - bb[1]}" preserveAspectRatio="xMidYMid meet">${s}</svg>`;
+  }
+  const dot = p => `<i class="pdot" style="background:${p.color};--pc:${p.color}"></i>`;
+  /** Glass scoreboard: holes owned is the big number. */
+  function scoreboard(m, r = resolve(m), big = false) {
+    return `<div class="sb ${big ? "big" : ""}">${m.players.map(p => { const t = r.table.find(x => x.id === p.id);
+      return `<div class="sb-p ${r.leader && r.leader.id === p.id ? "lead" : ""}" style="--pc:${p.color}"><div class="sb-name">${dot(p)}<span>${esc(p.name)}</span></div><div class="sb-n"><b>${t.holes}</b><small>${t.holes === 1 ? "hole" : "holes"}${r.played.length ? ` · ${rel(t.toPar)}` : ""}</small></div></div>`; }).join("")}</div>`;
+  }
+  const tally = (m, r = resolve(m)) => `<span class="tally">${m.players.map(p => `<b style="color:${p.color}">${r.table.find(x => x.id === p.id).holes}</b>`).join("<i>–</i>")}</span>`;
+
+  // ---------- geometry for the match course (GPS yardages) ----------
+  function geo() {
+    const b = mBoard(); if (!b || b.kind !== "osm") return null;
+    const c = getCourse(b.courseKey); if (!c) return null;
+    const loop = c.loops.find(l => l.id === b.loopId) || c.loops[0]; if (!loop) return null;
+    if (geo._k === b.key + c.fetchedAt + (S.outdoor ? 1 : 0) && geo._g) return geo._g;
+    const pj = OSM.projector(c.center[0], c.center[1]);
+    const F = {}; for (const k of Object.keys(c.features)) F[k] = c.features[k].map(r => r.map(pj.fwd));
+    const holes = loop.holes.map(h => {
+      const pts = h.line.map(pj.fwd), green = h.green >= 0 ? F.greens[h.green] : null;
+      return { id: "H" + h.ref, ref: h.ref, pts, tee: pts[0], end: pts[pts.length - 1], green, gC: green ? OSM.centroid(green) : pts[pts.length - 1] };
+    });
+    const outline = (c.outline || []).map(r => r.map(pj.fwd));
+    geo._k = b.key + c.fetchedAt + (S.outdoor ? 1 : 0); geo._g = { c, loop, pj, F, holes, outline };
+    return geo._g;
+  }
+  const geoHole = (g, id) => g && g.holes.find(h => h.id === id);
+  let tapPt = null, lastFix = null;
+  GPS.on(G => {
+    const g = geo(), m = M();
+    if (g && G.fix) {
+      const Pp = g.pj.fwd([G.fix.lat, G.fix.lon]); lastFix = { P: Pp, acc: G.fix.acc, sim: G.fix.sim };
+      const r = GPS.detect(g.holes.filter(h => !m || m.holes.includes(h.id)), Pp);
+      if (r.changed && r.holeId && m && !m.done && r.holeId !== m.cur) { m.cur = r.holeId; playEdit = null; tapPt = null; save(); if (onPlayish()) toast(`On #${m.cur.slice(1)} now · auto`); }
+      lastFix.offCourse = !!r.offCourse;
+    } else if (!G.fix) lastFix = null;
+    if (onPlayish()) repaint();
+  });
+  const onPlayish = () => /^#(play|cart)/.test(location.hash);
+  function yardsFor(hid) {
+    const g = geo(), gh = geoHole(g, hid); if (!gh) return null;
+    const usable = lastFix && !lastFix.offCourse && OSM.polyDist(lastFix.P, gh.pts) < 300;
+    const y = OSM.greenYardages(usable ? lastFix.P : gh.tee, gh.green, gh.gC);
+    if (y && tapPt) y.tap = OSM.dist2(usable ? lastFix.P : gh.tee, tapPt);
+    return y && { ...y, fromTee: !usable };
+  }
+  function simPath(g, fromId) {
+    const i = Math.max(0, g.holes.findIndex(h => h.id === fromId));
+    const seq = g.holes.slice(i).concat(g.holes.slice(0, i));
+    return seq.flatMap(h => { const pts = h.pts.slice(); if (h.gC) pts.push(h.gC); return pts.map(p => g.pj.inv(p)); });
+  }
+  function gpsChip() {
+    const G = GPS.G;
+    return G.mode === "off" ? `<button class="gps-chip off" data-gps>${ic("pin")}GPS</button>`
+      : G.error && !G.fix ? `<button class="gps-chip warn" data-gps>${esc(G.error)}</button>`
+      : !G.fix ? `<span class="gps-chip">${ic("pin")}Finding you…</span>`
+      : `<button class="gps-chip ${G.fix.acc <= 10 ? "good" : G.fix.acc <= 25 ? "ok" : "warn"}" data-gpsinfo><i></i>${G.fix.sim ? "SIM · " : ""}±${Math.round(G.fix.acc)} m</button>`;
+  }
+  function bindGps(root) {
+    root.querySelectorAll("[data-gps]").forEach(x => x.onclick = () => { if (GPS.G.mode === "sim") return; GPS.setAuto(true); GPS.startLive(); });
+    root.querySelectorAll("[data-gpsinfo]").forEach(x => x.onclick = () => toast(GPS.G.fix.sim ? "Simulated GPS: walking the real hole line." : `GPS accuracy ±${Math.round(GPS.G.fix.acc)} m. Under 10 m is great.`));
+  }
+
+  // ---------- svg drawing helpers (local meters) ----------
+  const polyStr = (pts, T) => pts.map(p => T(p).map(v => v.toFixed(1)).join(",")).join(" ");
+  function featuresSvg(g, T, box, k, opts = {}) {
+    const near = r => r.some(p => { const q = T(p); return q[0] > box[0] - 80 && q[0] < box[2] + 80 && q[1] > box[1] - 80 && q[1] < box[3] + 80; });
+    const od = S.outdoor;
+    const poly = (arr, fill, stroke, sw) => arr.filter(near).map(r => `<polygon points="${polyStr(r, T)}" fill="${fill}" ${stroke ? `stroke="${stroke}" stroke-width="${sw * k}"` : ""} stroke-linejoin="round"/>`).join("");
+    return poly(g.outline, od ? "#CFE3B5" : "#16241a", null, 0)
+      + poly(g.F.fairways, od ? "#4E9E45" : "#1f5a35", od ? "#2f6d2a" : null, 1)
+      + poly(g.F.water, od ? "#2C8FD0" : "#1f6f9c", od ? "#0f5a8c" : "#2b86b8", 1)
+      + poly(g.F.tees, od ? "#3f8c39" : "#2b7a45", "#fff", .8)
+      + poly(g.F.greens, od ? "#3FBF4F" : "#3fcf7c", od ? "#0b4d18" : "#fff", od ? 2 : 1.4)
+      + poly(g.F.bunkers, od ? "#FFF2D2" : "#d8c9a2", od ? "#8a6a2a" : "#b9a57a", od ? 1.6 : 1);
+  }
+
+  /** Current hole drawn tee-at-bottom, green-at-top (rotated), sized to the viewport. */
+  function holeSvg(g, gh, Wpx, Hpx, o = {}) {
+    const a = gh.tee, z = gh.gC, ang = Math.atan2(z[1] - a[1], z[0] - a[0]), phi = Math.PI / 2 - ang, cs = Math.cos(phi), sn = Math.sin(phi);
+    const T = p => [p[0] * cs - p[1] * sn, -(p[0] * sn + p[1] * cs)];
+    const Ti = q => { const x = q[0], y = -q[1]; return [x * cs + y * sn, -x * sn + y * cs]; };
+    const key = [...gh.pts, ...(gh.green || []), gh.gC].map(T);
+    let b = key.reduce((m, [x, y]) => [Math.min(m[0], x), Math.min(m[1], y), Math.max(m[2], x), Math.max(m[3], y)], [Infinity, Infinity, -Infinity, -Infinity]);
+    b = [b[0] - 35, b[1] - 48, b[2] + 35, b[3] + 22];
+    let w = b[2] - b[0], h = b[3] - b[1];
+    const ar = Wpx / Hpx;
+    if (w / h < ar) { const nw = h * ar; b[0] -= (nw - w) / 2; b[2] += (nw - w) / 2; w = nw; } else { const nh = w / ar; b[1] -= (nh - h) / 2; b[3] += (nh - h) / 2; h = nh; }
+    const k = h / Hpx;  // meters per css px
+    let s = `<rect x="${b[0]}" y="${b[1]}" width="${w}" height="${h}" fill="${S.outdoor ? "#F4EBD8" : (o.bg || "#0f1511")}"/>`;
+    s += `<polyline points="${polyStr(gh.pts, T)}" fill="none" stroke="${S.outdoor ? "#9DCB86" : "#1d4a2c"}" stroke-width="${46}" stroke-linecap="round" stroke-linejoin="round" opacity=".55"/>`;
+    s += featuresSvg(g, T, b, k);
+    // distance arcs from the tee: 100/150/200/250 yds to the green
+    const gc = T(gh.gC);
+    [100, 150, 200, 250].forEach(yds => { const m = yds * 0.9144; if (m > OSM.lineLen(gh.pts) + 20) return;
+      s += `<path d="M${gc[0] - m * .2} ${gc[1] + m * .98} A ${m} ${m} 0 0 0 ${gc[0] + m * .2} ${gc[1] + m * .98}" fill="none" stroke="${S.outdoor ? "#111" : "#fff"}" stroke-opacity=".55" stroke-width="${1.2 * k}" stroke-dasharray="${4 * k} ${3 * k}"/>
+        <text x="${gc[0] + m * .2 + 4 * k}" y="${gc[1] + m * .98 + 4 * k}" font-size="${10 * k}" font-family="Barlow Cond, sans-serif" font-style="italic" font-weight="800" fill="${S.outdoor ? "#111" : "#fff"}" opacity=".85">${yds}</text>`; });
+    s += `<polyline points="${polyStr(gh.pts, T)}" fill="none" stroke="${S.outdoor ? "#111" : "#fff"}" stroke-width="${2 * k}" stroke-dasharray="${5 * k} ${4 * k}" stroke-linecap="round" opacity=".9"/>`;
+    s += `<g transform="translate(${gc[0]},${gc[1]})"><path d="M0 0V${-26 * k}" stroke="#1b0f08" stroke-width="${2 * k}"/><path d="M0 ${-26 * k}h${14 * k}l${-4 * k} ${5 * k} ${4 * k} ${5 * k}H0z" fill="#FFB547"/><circle r="${2.6 * k}" fill="#1b0f08"/></g>`;
+    const tt = T(gh.tee); s += `<circle cx="${tt[0]}" cy="${tt[1]}" r="${5 * k}" fill="#fff" stroke="#1b0f08" stroke-width="${1.5 * k}"/>`;
+    let P = lastFix && !lastFix.offCourse ? T(lastFix.P) : null;
+    if (P && (P[0] < b[0] - 60 || P[0] > b[2] + 60 || P[1] < b[1] - 60 || P[1] > b[3] + 60)) P = null;
+    const from = P || tt;
+    if (tapPt) {
+      const tp = T(tapPt), d1 = Math.hypot(tp[0] - from[0], tp[1] - from[1]), d2 = Math.hypot(tp[0] - gc[0], tp[1] - gc[1]);
+      const lbl = (x, y, t) => `<g transform="translate(${x},${y})"><rect x="${-20 * k}" y="${-11 * k}" width="${40 * k}" height="${22 * k}" rx="${11 * k}" fill="#1b0f08"/><text y="${4.5 * k}" text-anchor="middle" font-size="${12 * k}" font-family="Barlow Cond, sans-serif" font-style="italic" font-weight="900" fill="#FFB547">${t}</text></g>`;
+      s += `<line x1="${from[0]}" y1="${from[1]}" x2="${tp[0]}" y2="${tp[1]}" stroke="#FFB547" stroke-width="${2.5 * k}"/><line x1="${tp[0]}" y1="${tp[1]}" x2="${gc[0]}" y2="${gc[1]}" stroke="#FFB547" stroke-width="${2.5 * k}" stroke-dasharray="${4 * k} ${3 * k}"/>
+        <circle cx="${tp[0]}" cy="${tp[1]}" r="${8 * k}" fill="none" stroke="#FFB547" stroke-width="${3 * k}"/><circle cx="${tp[0]}" cy="${tp[1]}" r="${2.5 * k}" fill="#FFB547"/>
+        ${lbl((from[0] + tp[0]) / 2 + 26 * k, (from[1] + tp[1]) / 2, yd(d1))}${lbl((tp[0] + gc[0]) / 2 + 26 * k, (tp[1] + gc[1]) / 2, yd(d2))}`;
+    }
+    if (P) s += `<circle cx="${P[0]}" cy="${P[1]}" r="${Math.max(lastFix.acc, 3)}" fill="#5AB4FF" fill-opacity=".16" stroke="#5AB4FF" stroke-opacity=".4" stroke-width="${k}"/><circle class="me-dot" cx="${P[0]}" cy="${P[1]}" r="${8 * k}" fill="#5AB4FF" stroke="#fff" stroke-width="${3 * k}"/>`;
+    return { svg: `<svg class="holemap" viewBox="${b[0]} ${b[1]} ${w} ${h}" preserveAspectRatio="xMidYMid meet">${s}</svg>`, Ti };
+  }
+
+
+  function courseSvg(g, m, Wpx, Hpx) {
+    const r = resolve(m), T = p => [p[0], -p[1]];
+    const holes = g.holes.filter(h => m.holes.includes(h.id));
+    const all = [...g.outline.flat(), ...holes.flatMap(h => h.pts)].map(T);
+    let b = all.reduce((a, [x, y]) => [Math.min(a[0], x), Math.min(a[1], y), Math.max(a[2], x), Math.max(a[3], y)], [Infinity, Infinity, -Infinity, -Infinity]);
+    b = [b[0] - 30, b[1] - 30, b[2] + 30, b[3] + 30];
+    let w = b[2] - b[0], h = b[3] - b[1]; const ar = Wpx / Hpx;
+    if (w / h < ar) { const nw = h * ar; b[0] -= (nw - w) / 2; w = nw; } else { const nh = w / ar; b[1] -= (nh - h) / 2; h = nh; }
+    const k = Math.max(w / Wpx, h / Hpx);
+    let s = `<rect x="${b[0]}" y="${b[1]}" width="${w}" height="${h}" fill="#0f1511"/>` + featuresSvg(g, T, b, k);
+    holes.forEach(gh => {
+      const own = r.owner[gh.id], p = own && pl(own), col = p ? p.color : "#2a312b";
+      s += `<polyline points="${polyStr(gh.pts, T)}" fill="none" stroke="${p ? p.color : "rgba(255,255,255,.6)"}" stroke-width="${2.2 * k}" stroke-linecap="round" opacity=".9"/>`;
+      const t = T(gh.tee);
+      s += `<g><circle cx="${t[0]}" cy="${t[1]}" r="${12 * k}" fill="${col}" stroke="${gh.id === m.cur ? "#fff" : "rgba(0,0,0,.4)"}" stroke-width="${2 * k}"/><text x="${t[0]}" y="${t[1] + 4 * k}" text-anchor="middle" font-size="${11 * k}" font-weight="800" fill="${p ? p.ink : "#fff"}">${gh.ref}</text></g>`;
+    });
+    if (lastFix && !lastFix.offCourse) { const p = T(lastFix.P); s += `<circle class="me-dot" cx="${p[0]}" cy="${p[1]}" r="${7 * k}" fill="#5AB4FF" stroke="#fff" stroke-width="${2.5 * k}"/>`; }
+    return `<svg class="coursemap" viewBox="${b[0]} ${b[1]} ${w} ${h}">${s}</svg>`;
+  }
+
+  // ---------- sheet ----------
+  function closeSheet() { sheetRoot.innerHTML = ""; }
+  function sheet(html) {
+    sheetRoot.innerHTML = `<div class="scrim"></div><div class="sheet"><div class="grabber"></div>${html}</div>`;
+    $(".scrim", sheetRoot).onclick = closeSheet;
+  }
+
+  // ---------- welcome ----------
+  // PWA install: Android/Chrome gets a real prompt, iPhone Safari gets the Add to Home Screen hint.
+  let deferredInstall = null;
+  const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const standalone = () => (window.matchMedia && matchMedia("(display-mode: standalone)").matches) || navigator.standalone === true;
+  window.addEventListener("beforeinstallprompt", e => { e.preventDefault(); deferredInstall = e; paintInstall(); });
+  window.addEventListener("appinstalled", () => { deferredInstall = null; paintInstall(); toast("Installed. Find Fairway Conquest on your home screen."); });
+  function installHtml() {
+    if (standalone()) return "";
+    if (deferredInstall) return `<button class="install-btn" data-instbtn>${ic("download")}<span><b>Install the app</b><em>Full screen, works offline on the course</em></span></button>`;
+    if (isIOS) return `<div class="install-ios">${ic("share")}<span><b>Get the app:</b> tap <b>Share</b>, then <b>Add to Home Screen</b>.</span></div>`;
+    return "";
+  }
+  function paintInstall() {
+    document.querySelectorAll("[data-install]").forEach(el => {
+      el.innerHTML = installHtml();
+      const b = el.querySelector("[data-instbtn]");
+      if (b) b.onclick = async () => { const d = deferredInstall; if (!d) return; d.prompt(); try { await d.userChoice; } catch (e) {} deferredInstall = null; paintInstall(); };
+    });
+  }
+
+  function showOnboarding() {
+    overlayRoot.innerHTML = `<div class="onb" role="dialog" aria-modal="true" aria-labelledby="onb-title">
+      <div class="onb-bg" aria-hidden="true"></div>
+      <div class="onb-top"><div class="onb-brand"><span class="brand-mark sm">${ic("flag", "#04130a")}</span>Fairway Conquest</div>
+        <h1 class="onb-title" id="onb-title">Own the<br><span>course.</span></h1></div>
+      <div class="onb-body">
+        <p class="onb-sub">Head-to-head on a real course. Win a hole, it's yours. Win by two, steal one.</p>
+        <button class="onb-cta" id="onb-go">Start a match</button>
+        <div data-install class="onb-install">${installHtml()}</div>
+        <a class="onb-link" id="onb-how" href="#rules">How it works</a>
+      </div></div>`;
+    const done = () => { S.onboarded = true; save(); };
+    $("#onb-go").onclick = () => { done(); overlayRoot.innerHTML = ""; location.hash = "#new"; };
+    $("#onb-how").onclick = () => { done(); };
+    paintInstall();
+  }
+
+  // ---------- HOME ----------
+  function header(title, eyebrow = "", right = "") {
+    return `<header class="hdr"><div style="min-width:0">${eyebrow ? `<div class="eyebrow">${eyebrow}</div>` : ""}<h1 class="h1">${title}</h1></div><div class="hdr-r">${right}</div></header>`;
+  }
+  function renderHome() {
+    const m = M();
+    let main;
+    if (m && !m.done) {
+      const r = resolve(m), b = mBoard(m), h = b.holes[m.cur];
+      main = `<section class="live card">
+        <div class="live-top"><span class="live-tag"><i></i>Live match</span>${synced(m) ? `<span data-net>${netChipHtml()}</span>` : `<span class="muted sm">${esc(shortName(b.name))}</span>`}</div>
+        <div class="live-hole">Hole ${h ? h.ref : "—"} <span>· ${r.played.length} of ${m.holes.length} played${synced(m) ? " · " + esc(shortName(b.name)) : ""}</span></div>
+        ${scoreboard(m, r)}
+        <div class="live-board terrain">${hexBoard(m)}</div>
+        <div class="row2"><a class="btn primary" href="#play">Resume</a><a class="btn ghost" href="#cart">${ic("cart")}Cart display</a></div>
+      </section>`;
+    } else {
+      main = `<section class="hero">
+        <div class="hero-bg" aria-hidden="true"></div>
+        <div class="eyebrow sun">Head-to-head · real courses</div>
+        <h1 class="hero-title">Play your friends.<br><span>Take the course.</span></h1>
+        <p>Every hole is territory. Most holes wins.</p>
+        <a class="btn primary big" href="#new">${ic("plus")}New match</a>
+      </section>`;
+    }
+    const hist = S.history.slice(0, 5);
+    view.innerHTML = `<div class="screen">
+      <header class="hdr"><div class="brand"><div class="brand-mark">${ic("flag", "#04130a")}</div><b>Fairway Conquest</b></div>
+        <div class="hdr-r"><a class="icon-btn" href="#rules" aria-label="How it works">${ic("help")}</a></div></header>
+      ${main}
+      ${m && !m.done ? "" : `<div class="ways">
+        <a class="way" href="#new"><div class="way-ic">${ic("phone")}</div><b>Phone vs phone</b><span>Your friend scans a code. Scores sync live.</span></a>
+        <a class="way" href="#cart"><div class="way-ic sun">${ic("cart")}</div><b>On the cart</b><span>Big-screen mode for cart monitors.</span></a></div>`}
+      ${emailCard("home")}
+      ${hist.length ? `<div class="sect"><h2 class="h2">Recent matches</h2></div><div class="list">${hist.map(x => `<div class="li"><div class="li-ic" style="background:${x.color}">${ic("trophy", x.ink)}</div><div class="li-main"><b>${esc(x.title)}</b><span>${esc(x.sub)}${x.money ? ` · ${esc(x.money)}` : ""}</span></div></div>`).join("")}</div>` : ""}
+      <div data-install class="home-install">${installHtml()}</div>
+      <p class="fineprint">Scores and stakes live on your phones. Course maps © OpenStreetMap contributors.</p>
+    </div>`;
+    bindTips(view); paintInstall();
+    if (!S.onboarded) showOnboarding();
+  }
+
+  // ---------- NEW MATCH ----------
+  function renderNew() {
+    const d = S.draft, b = d.boardKey && S.boards[d.boardKey];
+    const boards = Object.values(S.boards);
+    const quickLeft = QUICK.filter(q => !boards.some(x => x.courseKey === `${q.type}/${q.id}`));
+    const seg = (name, opts, cur) => `<div class="seg" data-seg="${name}">${opts.map(([v, l]) => `<button class="${v === cur ? "on" : ""}" data-v="${v}">${l}</button>`).join("")}</div>`;
+    const nh = b ? holeIds(b).length : 0;
+    view.innerHTML = `<div class="screen new">
+      ${header("New match", "", `<a class="icon-btn" href="#home" aria-label="Close">${ic("close")}</a>`)}
+      <div class="step"><span class="step-n">1</span><h2 class="h2">Course</h2></div>
+      <div class="list">
+        ${boards.map(x => `<button class="li pick ${x.key === d.boardKey ? "sel" : ""}" data-board="${esc(x.key)}"><div class="li-ic">${ic(x.kind === "osm" ? "pin" : "flag")}</div><div class="li-main"><b>${esc(shortName(x.name))}</b><span>${holeIds(x).length} holes · Par ${parOf(x)}${x.kind === "osm" ? " · GPS yardages" : " · no map"}</span></div><span class="radio"></span></button>`).join("")}
+        ${quickLeft.map(q => `<button class="li pick" data-quick="${q.id}"><div class="li-ic">${ic("pin")}</div><div class="li-main"><b>${esc(shortName(q.name))}</b><span>${esc(q.area)} · GPS yardages</span></div><span class="radio"></span></button>`).join("")}
+        <a class="li ghosty" href="#courses"><div class="li-ic">${ic("search")}</div><div class="li-main"><b>Find any course</b><span>Synced from OpenStreetMap</span></div>${ic("chev")}</a>
+      </div>
+      ${nh > 9 ? `<div class="pad mt8">${seg("range", [["all", nh + " holes"], ["front", "Front 9"], ["back", "Back 9"]], d.range)}</div>` : ""}
+      <div class="step"><span class="step-n">2</span><h2 class="h2">Players</h2></div>
+      <div class="list">${d.players.map((p, i) => `<div class="li pl"><i class="pdot lg" style="background:${COLORS[i]}"></i><input data-pname="${i}" value="${esc(p.name)}" placeholder="${i ? "Friend's name" : "Your name"}" maxlength="16" autocomplete="off">${i > 1 ? `<button class="x" data-prm="${i}" aria-label="Remove">${ic("close")}</button>` : ""}</div>`).join("")}
+        ${d.players.length < 4 ? `<button class="li ghosty" id="addp"><div class="li-ic">${ic("plus")}</div><div class="li-main"><b>Add a player</b><span>Up to 4. Same rules, more chaos.</span></div></button>` : ""}</div>
+      <div class="pad mt8">${seg("mode", [["local", "One phone"], ["invite", "Each on own phone"]], d.mode)}</div>
+      ${d.mode === "invite" ? `<div class="note">${ic("qr")}<span><b>Live on two phones.</b> After you start, your friend scans a QR code to join. Each phone enters its own score; territory and stakes sync live. No accounts.</span></div>` : ""}
+      <div class="step"><span class="step-n">3</span><h2 class="h2">Stakes <span class="opt">optional</span></h2></div>
+      <div class="pad">${seg("stake", [["none", "None"], ["hole", "Per hole"], ["match", "Match"], ["both", "Both"]], d.stake.type)}</div>
+      ${d.stake.type !== "none" ? `<div class="stakes-set">
+        ${d.stake.type !== "match" ? `<div class="amt"><span>Per hole won</span><div class="stepper"><button data-amt="hole:-1">−</button><b>$${d.stake.hole}</b><button data-amt="hole:1">+</button></div></div>` : ""}
+        ${d.stake.type !== "hole" ? `<div class="amt"><span>Match winner</span><div class="stepper"><button data-amt="match:-1">−</button><b>$${d.stake.match}</b><button data-amt="match:1">+</button></div></div>` : ""}
+        <div class="track">${ic("dollar")}Tracking only for now. No money moves in the app.</div></div>` : ""}
+      <div class="sticky"><button class="btn primary big block" id="start" ${b ? "" : "disabled"}>${b ? "Start match" : "Pick a course"}</button></div>
+    </div>`;
+    view.querySelectorAll("[data-board]").forEach(x => x.onclick = () => { d.boardKey = x.dataset.board; d.range = "all"; save(); renderNew(); });
+    view.querySelectorAll("[data-quick]").forEach(x => x.onclick = () => loadQuick(QUICK.find(q => q.id === +x.dataset.quick)));
+    view.querySelectorAll("[data-pname]").forEach(x => x.oninput = () => { d.players[+x.dataset.pname].name = x.value; save(); });
+    view.querySelectorAll("[data-prm]").forEach(x => x.onclick = () => { d.players.splice(+x.dataset.prm, 1); save(); renderNew(); });
+    const ap = $("#addp"); if (ap) ap.onclick = () => { d.players.push({ name: "" }); save(); renderNew(); };
+    view.querySelectorAll("[data-seg]").forEach(sg => sg.querySelectorAll("button").forEach(x => x.onclick = () => {
+      const k = sg.dataset.seg, v = x.dataset.v; if (k === "stake") d.stake.type = v; else d[k] = v; save(); renderNew(); }));
+    const STEPS = [1, 2, 5, 10, 20, 25, 50, 100];
+    view.querySelectorAll("[data-amt]").forEach(x => x.onclick = () => { const [k, dir] = x.dataset.amt.split(":"); const i = STEPS.indexOf(d.stake[k]); d.stake[k] = STEPS[Math.max(0, Math.min(STEPS.length - 1, (i < 0 ? 2 : i) + +dir))]; save(); renderNew(); });
+    $("#start").onclick = () => {
+      if (!b) return;
+      if (d.players.slice(1).some(p => !p.name.trim())) { toast("Add your friend's name."); view.querySelector('[data-pname="1"]').focus(); return; }
+      emailGate(() => { newMatch(d); netBoot(); location.hash = synced() ? "#invite" : "#play"; });
+    };
+  }
+  async function loadQuick(q) {
+    const key = `${q.type}/${q.id}`;
+    let c = getCourse(key);
+    if (!c) {
+      overlayRoot.innerHTML = `<div class="busy"><div class="spinner big"></div><b>${esc(q.name)}</b><span>Loading the course map…</span></div>`;
+      try { const r = await fetch(`data/${q.type}-${q.id}.json`); c = OSM.parseCourse(await r.json(), { key, name: q.name, area: q.area, source: "snapshot" }); saveCourse(c); }
+      catch (e) { overlayRoot.innerHTML = ""; toast("Couldn't load that course."); return; }
+      overlayRoot.innerHTML = "";
+    }
+    if (!c.loops.length) return noHolesSheet(c);
+    if (c.loops.length > 1) return pickLoopSheet(c);
+    useBoard(buildBoard(c, c.loops[0].id));
+  }
+  function useBoard(b) { S.draft.boardKey = b.key; S.draft.range = "all"; save(); if (location.hash !== "#new") location.hash = "#new"; else renderNew(); }
+
+  // ---------- course search (OpenStreetMap) ----------
   let searchState = { q: "", label: "", list: null, busy: false, err: null };
   function renderCourses() {
-    const saved = Object.values(S.boards).filter(b => b.kind !== "demo");
     view.innerHTML = `<div class="screen">
-      <div class="map-top"><div><div class="eyebrow">Sync any course</div><h1 class="h1" style="font-size:26px;margin-top:4px">Courses</h1></div><a class="icon-btn" href="#home">${ic("close")}</a></div>
+      ${header("Find a course", "OpenStreetMap", `<a class="icon-btn" href="#new" aria-label="Back">${ic("back")}</a>`)}
       <form class="search" id="sform"><input id="q" type="search" placeholder="Course name or town…" value="${esc(searchState.q)}" autocomplete="off" enterkeyhint="search"><button class="btn primary small" type="submit">Search</button></form>
-      <div class="pad" style="margin-top:10px"><button class="btn ghost block" id="near">${ic("eye")}Find courses near me</button></div>
+      <div class="pad mt8"><button class="btn ghost block" id="near">${ic("pin")}Courses near me</button></div>
       <div id="sres">${resultsHtml()}</div>
-      ${saved.length ? `<div class="section-head"><h2 class="h2">Synced</h2><span class="muted" style="font-size:12px">Saved on this phone</span></div>
-        <div class="results">${saved.map(b => `<button class="result" data-board="${esc(b.key)}"><div class="r-ic" style="background:#1F7A4D">${Object.keys(b.holes).length}</div><div class="who"><b>${esc(b.name)}</b><span>${b.kind === "manual" ? "Set up by hand · no map" : "OpenStreetMap layout"}${b.key === S.active ? " · playing now" : ""}</span></div>${ic("map", "#B9A58E")}</button>`).join("")}</div>` : ""}
-      <div class="section-head"><h2 class="h2">Demo</h2></div>
-      <div class="results"><button class="result" data-board="demo"><div class="r-ic" style="background:#B5532A">27</div><div class="who"><b>Demo board</b><span>3 fictional courses · no GPS</span></div>${ic("map", "#B9A58E")}</button></div>
-      <p class="fineprint">Course maps come from OpenStreetMap, edited by volunteers. Coverage varies: some courses have every hole mapped, some have none. Searches go to Nominatim and Overpass (free public servers) and get cached on your phone.<br><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener" style="color:#FFB13B">Map data © OpenStreetMap contributors (ODbL)</a></p>
+      <p class="fineprint">Coverage varies: some courses have every hole mapped, some have none. No holes mapped? You can still play: set it up by hand.<br><a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener" class="link">Map data © OpenStreetMap contributors (ODbL)</a></p>
     </div>`;
     $("#sform").onsubmit = e => { e.preventDefault(); const q = $("#q").value.trim(); if (q.length < 3) { toast("Type at least 3 letters."); return; } doSearch(() => OSM.search(q), q); };
     $("#near").onclick = () => {
       if (!navigator.geolocation || !window.isSecureContext) { toast("Near me needs GPS over https. Try a search instead."); return; }
       searchState = { ...searchState, busy: true, err: null, label: "Finding you…" }; paintResults();
-      navigator.geolocation.getCurrentPosition(p => doSearch(() => OSM.coursesNear(p.coords.latitude, p.coords.longitude, 25000).then(list => ({ label: "Courses within 25 km of you", list })), ""),
+      navigator.geolocation.getCurrentPosition(p => doSearch(() => OSM.coursesNear(p.coords.latitude, p.coords.longitude, 25000).then(list => ({ label: "Courses within 25 km", list })), ""),
         e => { searchState = { ...searchState, busy: false, err: e.code === 1 ? "Location blocked. Allow it, or search by name." : "Couldn't get your location." }; paintResults(); }, { enableHighAccuracy: false, timeout: 15000, maximumAge: 60000 });
     };
     bindResults(view);
@@ -718,11 +546,10 @@
     paintResults();
   }
   function bindResults(root) {
-    root.querySelectorAll("[data-board]").forEach(b => b.onclick = () => { S.active = b.dataset.board; adjCache = { key: null }; save(); GPS.D.holeId = null; toast(`Playing ${board().name}.`); location.hash = board().kind === "demo" ? "#map" : "#course"; });
     root.querySelectorAll("[data-osm]").forEach(b => b.onclick = () => { const [t, id] = b.dataset.osm.split("/"); syncCourse(t, +id, { name: b.dataset.name, area: b.dataset.area, center: [+b.dataset.lat, +b.dataset.lon] }); });
   }
   async function syncCourse(type, id, meta) {
-    overlayRoot.innerHTML = `<div class="busy"><div class="spinner big"></div><b>${esc(meta.name)}</b><span id="ostatus2">Pulling holes, greens and bunkers from OpenStreetMap…</span><button class="btn ghost small" id="cancelsync" style="margin-top:10px">Cancel</button></div>`;
+    overlayRoot.innerHTML = `<div class="busy"><div class="spinner big"></div><b>${esc(meta.name)}</b><span id="ostatus2">Pulling holes and greens from OpenStreetMap…</span><button class="btn ghost small" id="cancelsync" style="margin-top:10px">Cancel</button></div>`;
     $("#cancelsync").onclick = () => OSM.cancel();
     OSM.onStatus(t => { const el = $("#ostatus2"); if (el) el.textContent = t; });
     let c;
@@ -732,313 +559,582 @@
     saveCourse(c);
     if (!c.loops.length) return noHolesSheet(c);
     if (c.loops.length > 1) return pickLoopSheet(c);
-    finishSync(c, c.loops[0].id);
-  }
-  function finishSync(c, loopId) {
-    const b = buildBoard(c, loopId); GPS.D.holeId = null; GPS.D.auto = true;
-    const loop = c.loops.find(l => l.id === loopId);
-    const guessed = loop.holes.filter(h => h.parSource === "guess").length;
-    toast(`${loop.holes.length} holes synced${c.source === "snapshot" ? " (saved snapshot)" : ""}.${guessed ? ` ${guessed} pars guessed. Check them.` : ""}`);
-    location.hash = "#course";
+    useBoard(buildBoard(c, c.loops[0].id));
   }
   function pickLoopSheet(c) {
-    sheet(`<div class="eyebrow">${esc(c.name)}</div><h2 class="h1" style="font-size:24px;margin:6px 0 4px">Which course?</h2>
-      <div class="muted" style="font-size:14px">This club has ${c.loops.reduce((a, l) => a + l.holes.length, 0)} holes mapped. Pick the one you're playing.</div>
-      <div class="results" style="margin:14px 0 0">${c.loops.map(l => `<button class="result" data-loop="${l.id}"><div class="r-ic" style="background:#1F7A4D">${l.holes.length}</div><div class="who"><b>${esc(l.name)}</b><span>${l.parsKnown ? `Par ${l.holes.reduce((a, h) => a + h.par, 0)}${l.parsKnown < l.holes.length ? " (some guessed)" : ""}` : "Pars not mapped. You can set them."} · ${l.holes.reduce((a, h) => a + h.yards, 0).toLocaleString()} yds</span></div></button>`).join("")}</div>`);
-    sheetRoot.querySelectorAll("[data-loop]").forEach(b => b.onclick = () => { closeSheet(); finishSync(c, b.dataset.loop); });
+    sheet(`<div class="eyebrow">${esc(c.name)}</div><h2 class="h1 sm">Which course?</h2>
+      <div class="list flush">${c.loops.map(l => `<button class="li" data-loop="${l.id}"><div class="li-ic">${l.holes.length}</div><div class="li-main"><b>${esc(l.name)}</b><span>Par ${l.holes.reduce((a, h) => a + h.par, 0)} · ${l.holes.reduce((a, h) => a + h.yards, 0).toLocaleString()} yds</span></div>${ic("chev")}</button>`).join("")}</div>`);
+    sheetRoot.querySelectorAll("[data-loop]").forEach(b => b.onclick = () => { closeSheet(); useBoard(buildBoard(c, b.dataset.loop)); });
   }
   function noHolesSheet(c) {
-    sheet(`<div class="eyebrow">${esc(c.name)}</div><h2 class="h1" style="font-size:24px;margin:6px 0 8px">No holes mapped yet</h2>
-      <div class="muted" style="font-size:14.5px;line-height:1.45">OpenStreetMap has this course's outline${c.features.bunkers.length ? ` and ${c.features.bunkers.length} bunkers` : ""}, but not its holes. So no GPS yardages here yet.</div>
-      <div style="display:grid;gap:10px;margin-top:16px">
-        <button class="btn primary block" id="man18">Set up 18 holes by hand</button>
-        <button class="btn ghost block" id="man9">Set up 9 holes by hand</button>
-        <button class="btn ghost block" id="demo">Play the demo board instead</button></div>
-      <div class="sub">By hand = territory game + score entry, you set the pars. Anyone can add the holes on <a href="https://wiki.openstreetmap.org/wiki/Tag:leisure%3Dgolf_course" target="_blank" rel="noopener" style="color:#FFB13B">OpenStreetMap</a>.</div>`);
-    const man = n => { closeSheet(); buildBoard(c, null, n); toast(`${n} holes set up. Set your pars.`); location.hash = "#course"; setTimeout(() => parSheet(), 300); };
-    $("#man18").onclick = () => man(18); $("#man9").onclick = () => man(9);
-    $("#demo").onclick = () => { closeSheet(); S.active = "demo"; adjCache = { key: null }; save(); location.hash = "#map"; };
-  }
-  function parSheet() {
-    const b = board(), c = getCourse(b.courseKey), loop = c && c.loops.find(l => l.id === b.loopId);
-    const ids = Object.keys(b.holes).sort((x, y) => b.holes[x].ref - b.holes[y].ref);
-    const srcOf = h => { const lh = loop && loop.holes.find(x => x.ref === h.ref); return lh ? lh.parSource : "you"; };
-    sheet(`<div class="eyebrow">${esc(b.name)}</div><h2 class="h1" style="font-size:24px;margin:6px 0 4px">Pars</h2>
-      <div class="muted" style="font-size:13.5px">From OpenStreetMap where mapped. "Guess" = from hole length. Fix anything that's off.</div>
-      <div class="par-list">${ids.map(id => { const h = b.holes[id], src = srcOf(h); return `<div class="par-row"><b>#${h.ref}</b><span>${h.yards ? h.yards + " yds" : "—"}</span><span class="src ${src}">${src === "osm" ? "OSM" : src === "guess" ? "Guess" : "You"}</span>
-        <div class="fort-ctl"><button data-pm="${id}">−</button><output>${h.par}</output><button class="plus" data-pp="${id}">+</button></div></div>`; }).join("")}</div>
-      <div class="sub">Total par ${ids.reduce((a, id) => a + b.holes[id].par, 0)}</div>
-      <button class="btn primary block" id="pdone" style="margin-top:12px">Done</button>`);
-    const setPar = (id, d) => { const h = b.holes[id], np = Math.max(3, Math.min(6, h.par + d)), dd = np - h.par; h.par = np; if (dd && h.owner && P(h.owner).demo && h.strokes != null) h.strokes += dd; if (loop) { const lh = loop.holes.find(x => x.ref === h.ref); if (lh) { lh.par = h.par; lh.parSource = "manual"; } saveCourse(c); } save(); const y = sheetRoot.querySelector(".sheet").scrollTop; parSheet(); sheetRoot.querySelector(".sheet").scrollTop = y; };
-    sheetRoot.querySelectorAll("[data-pm]").forEach(x => x.onclick = () => setPar(x.dataset.pm, -1));
-    sheetRoot.querySelectorAll("[data-pp]").forEach(x => x.onclick = () => setPar(x.dataset.pp, 1));
-    $("#pdone").onclick = () => { closeSheet(); route(); };
+    sheet(`<div class="eyebrow">${esc(c.name)}</div><h2 class="h1 sm">No holes mapped yet</h2>
+      <p class="muted">OpenStreetMap has this course but not its holes, so no GPS yardages. You can still play the match: set it up by hand (every hole par 4, edit as you go).</p>
+      <div class="row2"><button class="btn primary" id="man18">18 holes</button><button class="btn ghost" id="man9">9 holes</button></div>`);
+    $("#man18").onclick = () => { closeSheet(); useBoard(buildBoard(c, null, 18)); };
+    $("#man9").onclick = () => { closeSheet(); useBoard(buildBoard(c, null, 9)); };
   }
 
-  // ---------- geometry for the active course ----------
-  function geo() {
-    const b = board(); if (b.kind !== "osm") return null;
-    const c = getCourse(b.courseKey); if (!c) return null;
-    const loop = c.loops.find(l => l.id === b.loopId) || c.loops[0]; if (!loop) return null;
-    if (geo._k === b.key + c.fetchedAt + (geo._v || 0) && geo._g) return geo._g;
-    const pj = OSM.projector(c.center[0], c.center[1]);
-    const F = {}; for (const k of Object.keys(c.features)) F[k] = c.features[k].map(r => r.map(pj.fwd));
-    const holes = loop.holes.map(h => {
-      const pts = h.line.map(pj.fwd), id = nineOf(h.ref).id + h.ref;
-      const green = h.green >= 0 ? F.greens[h.green] : null;
-      return { id, ref: h.ref, pts, tee: pts[0], end: pts[pts.length - 1], green, gC: green ? OSM.centroid(green) : pts[pts.length - 1] };
-    });
-    const outline = (c.outline || []).map(r => r.map(pj.fwd));
-    geo._k = b.key + c.fetchedAt + (geo._v || 0); geo._g = { c, loop, pj, F, holes, outline };
-    return geo._g;
+  // ---------- LIVE SYNC (two phones) ----------
+  // Each cell (hole x player) carries a last-write stamp (st) and a first-write stamp (fs).
+  // Merging two copies keeps the newest value per cell, so both phones converge whatever order messages arrive in.
+  const synced = (m = M()) => !!(m && m.mode === "invite" && m.net);
+  const myPid = (m = M()) => (m && m.net && m.net.myPid) || "p1";
+  function setCell(m, hid, pid, val, ts = Date.now()) {
+    m.st = m.st || {}; m.fs = m.fs || {};
+    (m.scores[hid] = m.scores[hid] || {})[pid] = val;
+    const k = hid + ":" + pid; m.st[k] = ts; if (!m.fs[k]) m.fs[k] = ts;
   }
-  const geoHole = (g, id) => g && g.holes.find(h => h.id === id);
-
-  // ---------- GPS wiring ----------
-  let playHole = null, playStrokes = null, tapPt = null, lastFix = null, playView = "hole";
-  GPS.on(G => {
-    const g = geo();
-    if (g && G.fix) {
-      const P = g.pj.fwd([G.fix.lat, G.fix.lon]); lastFix = { P, acc: G.fix.acc, sim: G.fix.sim };
-      const r = GPS.detect(g.holes, P);
-      if (r.changed && r.holeId && r.holeId !== playHole) {
-        const prevHole = playHole; playHole = r.holeId; playStrokes = null; tapPt = null;
-        if (prevHole && location.hash.startsWith("#play")) toast(`On #${num(playHole)} now · auto`);
+  const holeDone = (m, hid) => !!(m.scores[hid] && m.players.every(p => m.scores[hid][p.id] != null));
+  /** Synced matches order the log by when each hole was first completed, so both phones replay steals identically. */
+  function ordLog(m) {
+    if (!synced(m)) return;
+    const b = mBoard(m), fs = m.fs || {};
+    const ft = h => Math.max(0, ...m.players.map(p => fs[h + ":" + p.id] || 0));
+    m.log = [...new Set(m.log)].sort((a, c) => ft(a) - ft(c) || b.holes[a].ref - b.holes[c].ref);
+  }
+  const nextMine = m => synced(m) ? m.holes.find(h => !(m.scores[h] && m.scores[h][myPid(m)] != null)) : nextOpen(m);
+  const pub = m => { const { net, cur, ...rest } = m; return JSON.parse(JSON.stringify(rest)); };
+  function merge(L, R) {
+    let ch = false; L.st = L.st || {}; L.fs = L.fs || {};
+    const Rst = R.st || {}, Rfs = R.fs || {};
+    for (const hid of Object.keys(R.scores || {})) for (const pid of Object.keys(R.scores[hid])) {
+      const k = hid + ":" + pid, rt = Rst[k] || 0, lt = L.st[k] || 0, lv = L.scores[hid] && L.scores[hid][pid], rv = R.scores[hid][pid];
+      if (rv == null) continue;
+      if (lv == null || rt > lt) { if (lv !== rv || rt !== lt) { (L.scores[hid] = L.scores[hid] || {})[pid] = rv; L.st[k] = rt; ch = true; } }
+      if (Rfs[k] && (!L.fs[k] || Rfs[k] < L.fs[k])) { L.fs[k] = Rfs[k]; ch = true; }
+    }
+    (R.log || []).forEach(h => { if (!L.log.includes(h)) { L.log.push(h); ch = true; } });
+    if (NET.role() === "guest") {                       // host owns the roster, seats and stakes
+      if (JSON.stringify(L.players) !== JSON.stringify(R.players)) { L.players = R.players; ch = true; }
+      if (JSON.stringify(L.seats || {}) !== JSON.stringify(R.seats || {})) { L.seats = R.seats || {}; ch = true; }
+      if (JSON.stringify(L.stake) !== JSON.stringify(R.stake)) { L.stake = R.stake; ch = true; }
+    }
+    if (R.done && !L.done) { L.done = true; ch = true; }
+    return ch;
+  }
+  function pushState() { const m = M(); if (synced(m)) NET.send({ t: "state", match: pub(m) }); }
+  function courseFor(m) {
+    const b = mBoard(m); if (!b || b.kind !== "osm") return null;
+    if (QUICK.some(q => `${q.type}/${q.id}` === b.courseKey)) return null;      // guest loads preloaded courses from its own copy
+    return getCourse(b.courseKey);
+  }
+  function applyRemote(R, from) {
+    const m = M(); if (!m || m.id !== R.id) return;
+    const before = new Set(resolve(m).played), wasDone = m.done;
+    const ch = merge(m, R);
+    if (NET.role() === "host" && from) NET.reply(from, { t: "state", match: pub(m) });   // the sender may lack what we have
+    if (!ch) return;
+    ordLog(m); save();
+    if (NET.role() === "host") NET.send({ t: "state", match: pub(m) }, from);           // relay to any other phones
+    onRemoteChange(before, wasDone);
+  }
+  function onRemoteChange(before, wasDone) {
+    const m = M(), r = resolve(m), h = location.hash;
+    if (m.done && !wasDone) recordHistory(m);
+    if (sheetRoot.innerHTML) return;
+    if (/^#(play|cart)/.test(h)) {
+      if (m.done) { overlayRoot.innerHTML = ""; location.hash = "#result"; return; }
+      const fresh = r.played.filter(x => !before.has(x));
+      if (fresh.length && !overlayRoot.innerHTML) {
+        const hid = fresh[fresh.length - 1];
+        if (m.cur === hid || holeDone(m, m.cur)) { const n = nextMine(m); if (n) m.cur = n; save(); }
+        showHoleResult(m, hid, r.events.find(e => e.hole === hid), r, r.complete);
+      } else repaint();
+    } else if (/^#(home|map|stakes|invite|result)?$/.test(h.split("/")[0]) && !overlayRoot.innerHTML) route();
+  }
+  function netBoot() { const m = M(); if (!synced(m)) return; if (m.net.role === "host") NET.host(m.net.hostId); else NET.join(m.net.hostId); }
+  NET.on("open", () => { if (NET.role() === "guest") { const m = M(); NET.send({ t: "hello", dev: S.dev, match: m && synced(m) && m.net.hostId === NET.hostId() ? pub(m) : null }); } });
+  NET.on("msg", (d, c) => {
+    if (!d || !d.t) return;
+    const m = M();
+    if (d.t === "hello" && NET.role() === "host" && synced(m)) {
+      if (d.match && d.match.id === m.id) applyRemote(d.match, null);
+      NET.reply(c, { t: "state", match: pub(m), board: mBoard(m), course: courseFor(m) });
+    } else if (d.t === "state" && d.match) {
+      if (NET.role() === "guest" && (!m || m.id !== d.match.id)) {
+        if (pendingJoin && pendingJoin.hostId === NET.hostId()) { pendingJoin = { ...pendingJoin, match: d.match, board: d.board || pendingJoin.board, course: d.course || pendingJoin.course }; if (location.hash.startsWith("#join")) paintJoin(); }
+        return;
       }
-      lastFix.offCourse = !!r.offCourse;
-    } else if (!G.fix) lastFix = null;
-    if (location.hash.startsWith("#play")) paintPlay();
+      if (d.board && !S.boards[d.board.key]) { S.boards[d.board.key] = d.board; save(); }
+      if (d.course && !getCourse(d.course.key)) saveCourse(d.course);
+      applyRemote(d.match, NET.role() === "host" ? c : null);
+    } else if (d.t === "claim" && NET.role() === "host" && synced(m)) {
+      const p = m.players.find(x => x.id === d.pid); if (!p) return;
+      m.seats = m.seats || {}; m.seats[d.pid] = d.dev;
+      if (d.name && d.name.trim()) p.name = d.name.trim().slice(0, 16);
+      save(); NET.send({ t: "state", match: pub(m) });
+      toast(`${esc(p.name)} joined the match`);
+      if (/^#(invite|home|map|play)/.test(location.hash) && !overlayRoot.innerHTML && !sheetRoot.innerHTML) { if (location.hash.startsWith("#play")) repaint(); else route(); }
+    }
+  });
+  function netChipHtml() {
+    const m = M(); if (!synced(m)) return "";
+    const s = NET.status(), rival = m.players.filter(p => p.id !== myPid(m)).map(p => p.name).join(", ");
+    const T = { live: ["good", `Live · ${rival}`], waiting: ["ok", `Waiting for ${rival}`], connecting: ["ok", s.detail || "Connecting…"],
+      reconnecting: ["ok", s.detail || "Reconnecting…"], error: ["warn", s.detail || "Offline"], off: ["warn", "Offline · saved on this phone"] };
+    const [cls, t] = T[s.state] || T.off;
+    return `<span class="net-chip ${cls}" title="${esc(s.detail || "")}"><i></i>${esc(t)}</span>`;
+  }
+  function paintNet() { document.querySelectorAll("[data-net]").forEach(el => el.innerHTML = netChipHtml()); }
+  NET.on("status", () => {
+    paintNet();
+    if (location.hash.startsWith("#invite") && !sheetRoot.innerHTML) renderInvite();
+    else if (location.hash.startsWith("#join") && pendingJoin && !pendingJoin.match) paintJoin();
   });
 
-  function simPath(g, fromId) {
-    const i = Math.max(0, g.holes.findIndex(h => h.id === fromId));
-    const seq = g.holes.slice(i).concat(g.holes.slice(0, i));
-    return seq.flatMap(h => { const pts = h.pts.slice(); if (h.gC) pts.push(h.gC); return pts.map(p => g.pj.inv(p)); });
-  }
-
-  // ---------- svg drawing helpers (local meters) ----------
-  const polyStr = (pts, T) => pts.map(p => T(p).map(v => v.toFixed(1)).join(",")).join(" ");
-  function featuresSvg(g, T, box, k, opts = {}) {
-    const near = r => r.some(p => { const q = T(p); return q[0] > box[0] - 80 && q[0] < box[2] + 80 && q[1] > box[1] - 80 && q[1] < box[3] + 80; });
-    const od = S.outdoor;
-    const poly = (arr, fill, stroke, sw) => arr.filter(near).map(r => `<polygon points="${polyStr(r, T)}" fill="${fill}" ${stroke ? `stroke="${stroke}" stroke-width="${sw * k}"` : ""} stroke-linejoin="round"/>`).join("");
-    return poly(g.outline, od ? "#CFE3B5" : "#B9D79A", null, 0)
-      + poly(g.F.fairways, od ? "#4E9E45" : "#6DB85F", od ? "#2f6d2a" : null, 1)
-      + poly(g.F.water, od ? "#2C8FD0" : "#59B4DE", od ? "#0f5a8c" : "#3d97c4", 1)
-      + poly(g.F.tees, od ? "#3f8c39" : "#7CC56E", "#fff", .8)
-      + poly(g.F.greens, od ? "#3FBF4F" : "#9BE07F", od ? "#0b4d18" : "#fff", od ? 2 : 1.4)
-      + poly(g.F.bunkers, od ? "#FFF2D2" : "#F6E7C4", od ? "#8a6a2a" : "#d8bd85", od ? 1.6 : 1);
-  }
-
-  /** Current hole drawn tee-at-bottom, green-at-top (rotated), sized to the viewport. */
-  function holeSvg(g, gh, Wpx, Hpx) {
-    const a = gh.tee, z = gh.gC, ang = Math.atan2(z[1] - a[1], z[0] - a[0]), phi = Math.PI / 2 - ang, cs = Math.cos(phi), sn = Math.sin(phi);
-    const T = p => [p[0] * cs - p[1] * sn, -(p[0] * sn + p[1] * cs)];
-    const Ti = q => { const x = q[0], y = -q[1]; return [x * cs + y * sn, -x * sn + y * cs]; };
-    const key = [...gh.pts, ...(gh.green || []), gh.gC].map(T);
-    let b = key.reduce((m, [x, y]) => [Math.min(m[0], x), Math.min(m[1], y), Math.max(m[2], x), Math.max(m[3], y)], [Infinity, Infinity, -Infinity, -Infinity]);
-    b = [b[0] - 35, b[1] - 48, b[2] + 35, b[3] + 22];
-    let w = b[2] - b[0], h = b[3] - b[1];
-    const ar = Wpx / Hpx;
-    if (w / h < ar) { const nw = h * ar; b[0] -= (nw - w) / 2; b[2] += (nw - w) / 2; w = nw; } else { const nh = w / ar; b[1] -= (nh - h) / 2; b[3] += (nh - h) / 2; h = nh; }
-    const k = h / Hpx;  // meters per css px
-    let s = `<rect x="${b[0]}" y="${b[1]}" width="${w}" height="${h}" fill="${S.outdoor ? "#F4EBD8" : "#D8BC8C"}"/>`;
-    s += `<polyline points="${polyStr(gh.pts, T)}" fill="none" stroke="${S.outdoor ? "#9DCB86" : "#8EC370"}" stroke-width="${46}" stroke-linecap="round" stroke-linejoin="round" opacity=".55"/>`;
-    s += featuresSvg(g, T, b, k);
-    // distance arcs from the tee: 100/150/200/250 yds to the green
-    const gc = T(gh.gC);
-    [100, 150, 200, 250].forEach(yds => { const m = yds * 0.9144; if (m > OSM.lineLen(gh.pts) + 20) return;
-      s += `<path d="M${gc[0] - m * .2} ${gc[1] + m * .98} A ${m} ${m} 0 0 0 ${gc[0] + m * .2} ${gc[1] + m * .98}" fill="none" stroke="${S.outdoor ? "#111" : "#fff"}" stroke-opacity=".55" stroke-width="${1.2 * k}" stroke-dasharray="${4 * k} ${3 * k}"/>
-        <text x="${gc[0] + m * .2 + 4 * k}" y="${gc[1] + m * .98 + 4 * k}" font-size="${10 * k}" font-family="Unbounded" font-weight="800" fill="${S.outdoor ? "#111" : "#fff"}" opacity=".85">${yds}</text>`; });
-    s += `<polyline points="${polyStr(gh.pts, T)}" fill="none" stroke="${S.outdoor ? "#111" : "#fff"}" stroke-width="${2 * k}" stroke-dasharray="${5 * k} ${4 * k}" stroke-linecap="round" opacity=".9"/>`;
-    s += `<g transform="translate(${gc[0]},${gc[1]})"><path d="M0 0V${-26 * k}" stroke="#1b0f08" stroke-width="${2 * k}"/><path d="M0 ${-26 * k}h${14 * k}l${-4 * k} ${5 * k} ${4 * k} ${5 * k}H0z" fill="#FF6A2B"/><circle r="${2.6 * k}" fill="#1b0f08"/></g>`;
-    const tt = T(gh.tee); s += `<circle cx="${tt[0]}" cy="${tt[1]}" r="${5 * k}" fill="#fff" stroke="#1b0f08" stroke-width="${1.5 * k}"/>`;
-    let P = lastFix && !lastFix.offCourse ? T(lastFix.P) : null;
-    if (P && (P[0] < b[0] - 60 || P[0] > b[2] + 60 || P[1] < b[1] - 60 || P[1] > b[3] + 60)) P = null;
-    const from = P || tt;
-    if (tapPt) {
-      const tp = T(tapPt), d1 = Math.hypot(tp[0] - from[0], tp[1] - from[1]), d2 = Math.hypot(tp[0] - gc[0], tp[1] - gc[1]);
-      const lbl = (x, y, t) => `<g transform="translate(${x},${y})"><rect x="${-20 * k}" y="${-11 * k}" width="${40 * k}" height="${22 * k}" rx="${11 * k}" fill="#1b0f08"/><text y="${4.5 * k}" text-anchor="middle" font-size="${12 * k}" font-family="Unbounded" font-weight="900" fill="#FFB13B">${t}</text></g>`;
-      s += `<line x1="${from[0]}" y1="${from[1]}" x2="${tp[0]}" y2="${tp[1]}" stroke="#FFB13B" stroke-width="${2.5 * k}"/><line x1="${tp[0]}" y1="${tp[1]}" x2="${gc[0]}" y2="${gc[1]}" stroke="#FFB13B" stroke-width="${2.5 * k}" stroke-dasharray="${4 * k} ${3 * k}"/>
-        <circle cx="${tp[0]}" cy="${tp[1]}" r="${8 * k}" fill="none" stroke="#FFB13B" stroke-width="${3 * k}"/><circle cx="${tp[0]}" cy="${tp[1]}" r="${2.5 * k}" fill="#FFB13B"/>
-        ${lbl((from[0] + tp[0]) / 2 + 26 * k, (from[1] + tp[1]) / 2, yd(d1))}${lbl((tp[0] + gc[0]) / 2 + 26 * k, (tp[1] + gc[1]) / 2, yd(d2))}`;
+  // ---------- EMAIL (Kit list) ----------
+  const CFG = window.FC_CONFIG || {}, PLAN = CFG.PLAN_TITLE || "30-Day Practice Plan to Break 90";
+  const kitAction = () => CFG.KIT_FORM_ACTION || (CFG.KIT_FORM_ID ? `https://app.kit.com/forms/${encodeURIComponent(CFG.KIT_FORM_ID)}/subscriptions` : "");
+  const SUBS = "fc.signups";
+  const signups = () => { try { return JSON.parse(localStorage.getItem(SUBS)) || []; } catch (e) { return []; } };
+  const saveSignups = a => { try { localStorage.setItem(SUBS, JSON.stringify(a)); } catch (e) {} };
+  const validEmail = e => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e);
+  /** Sends any queued signups to Kit's public form endpoint once KIT_FORM_ID is set. Until then they wait on this phone. */
+  async function flushSignups() {
+    const url = kitAction(); if (!url || !navigator.onLine) return;
+    const a = signups(); let ch = false;
+    for (const x of a) if (!x.sent) {
+      try { const fd = new FormData(); fd.append("email_address", x.email); if (x.first) fd.append("first_name", x.first);
+        await fetch(url, { method: "POST", mode: "no-cors", body: fd }); x.sent = Date.now(); ch = true; } catch (e) {}
     }
-    if (P) s += `<circle cx="${P[0]}" cy="${P[1]}" r="${Math.max(lastFix.acc, 3)}" fill="#2F6BFF" fill-opacity=".16" stroke="#2F6BFF" stroke-opacity=".4" stroke-width="${k}"/><circle class="me-dot" cx="${P[0]}" cy="${P[1]}" r="${8 * k}" fill="#2F6BFF" stroke="#fff" stroke-width="${3 * k}"/>`;
-    return { svg: `<svg class="holemap" viewBox="${b[0]} ${b[1]} ${w} ${h}" preserveAspectRatio="xMidYMid meet">${s}</svg>`, Ti };
+    if (ch) saveSignups(a);
   }
-
-  function courseSvg(g, Wpx, Hpx) {
-    const T = p => [p[0], -p[1]];
-    const all = [...g.outline.flat(), ...g.holes.flatMap(h => h.pts)].map(T);
-    let b = all.reduce((m, [x, y]) => [Math.min(m[0], x), Math.min(m[1], y), Math.max(m[2], x), Math.max(m[3], y)], [Infinity, Infinity, -Infinity, -Infinity]);
-    b = [b[0] - 30, b[1] - 30, b[2] + 30, b[3] + 30];
-    let w = b[2] - b[0], h = b[3] - b[1]; const ar = Wpx / Hpx;
-    if (w / h < ar) { const nw = h * ar; b[0] -= (nw - w) / 2; w = nw; } else { const nh = w / ar; b[1] -= (nh - h) / 2; h = nh; }
-    const k = Math.max(w / Wpx, h / Hpx);
-    let s = `<rect x="${b[0]}" y="${b[1]}" width="${w}" height="${h}" fill="${S.outdoor ? "#F4EBD8" : "#D8BC8C"}"/>`;
-    s += featuresSvg(g, T, b, k);
-    g.holes.forEach(gh => {
-      const own = S.holes[gh.id], col = own && own.owner ? P(own.owner).color : "#8a7350";
-      s += `<polyline points="${polyStr(gh.pts, T)}" fill="none" stroke="${S.outdoor ? "#111" : "#fff"}" stroke-width="${2.2 * k}" stroke-linecap="round" opacity=".95"/>`;
-      const t = T(gh.tee);
-      s += `<g class="cm-hole" data-h="${gh.id}"><circle cx="${t[0]}" cy="${t[1]}" r="${12 * k}" fill="${col}" stroke="#fff" stroke-width="${2 * k}"/><text x="${t[0]}" y="${t[1] + 4 * k}" text-anchor="middle" font-size="${11 * k}" font-family="Unbounded" font-weight="900" fill="#fff">${gh.ref}</text></g>`;
+  function addSignup(first, email, ctx) {
+    const a = signups().filter(x => x.email.toLowerCase() !== email.toLowerCase());
+    a.push({ first, email, ctx, ts: Date.now(), sent: 0 }); saveSignups(a);
+    S.optin = { first, email, ts: Date.now() }; save(); flushSignups();
+  }
+  function emailCard(ctx, o = {}) {
+    if (S.optin) return o.hideDone ? "" : `<div class="tips card done">${ic("check")}<div><b>You're on the list${S.optin.first ? ", " + esc(S.optin.first) : ""}.</b><span>Sam's ${esc(PLAN)} goes to ${esc(S.optin.email)}.</span></div></div>`;
+    return `<form class="tips card" data-tips="${ctx}" novalidate>
+      <div class="tips-top"><div class="tips-ic">${ic("mail")}</div><div><div class="eyebrow sun">${o.eyebrow || "Free · golf tips"}</div><b class="tips-title">Get Sam's free ${esc(PLAN)}</b></div></div>
+      <div class="tips-row"><input name="first" placeholder="First name" autocomplete="given-name" maxlength="40" aria-label="First name"><input name="email" type="email" placeholder="Email" autocomplete="email" inputmode="email" maxlength="120" aria-label="Email"></div>
+      ${o.noButton ? "" : `<button class="btn primary block" type="submit">Send me the plan</button>`}
+      <p class="privacy">${ic("eye")}Only Sam's golf emails. Unsubscribe anytime. Never sold or shared.</p></form>`;
+  }
+  function readTips(f) { return { first: f.querySelector('[name="first"]').value.trim(), email: f.querySelector('[name="email"]').value.trim() }; }
+  function bindTips(root, after) {
+    root.querySelectorAll("form[data-tips]").forEach(f => f.onsubmit = e => {
+      e.preventDefault();
+      const { first, email } = readTips(f);
+      if (!validEmail(email)) { toast("That email doesn't look right."); f.querySelector('[name="email"]').focus(); return; }
+      addSignup(first, email, f.dataset.tips);
+      toast(`You're in${first ? ", " + esc(first) : ""}. The plan is on its way.`);
+      if (after) after(); else f.outerHTML = emailCard(f.dataset.tips);
     });
-    if (lastFix && !lastFix.offCourse) { const p = T(lastFix.P); s += `<circle class="me-dot" cx="${p[0]}" cy="${p[1]}" r="${7 * k}" fill="#2F6BFF" stroke="#fff" stroke-width="${2.5 * k}"/>`; }
-    return `<svg class="coursemap" viewBox="${b[0]} ${b[1]} ${w} ${h}">${s}</svg>`;
+  }
+  /** Ask once before a new match (skippable; asks again after a week). */
+  function emailGate(go) {
+    if (S.optin || (S.optinSkip && Date.now() - S.optinSkip < 7 * 864e5)) return go();
+    sheet(`<div class="eyebrow">Before you tee off</div><h2 class="h1 sm">Want to break 90?</h2>
+      ${emailCard("create", { eyebrow: "Free · 30 days" })}
+      <button class="btn ghost block mt8" id="skipmail">Skip, start the match</button>`);
+    bindTips(sheetRoot, () => { closeSheet(); go(); });
+    $("#skipmail").onclick = () => { S.optinSkip = Date.now(); save(); closeSheet(); go(); };
   }
 
-  // ---------- course map screen ----------
-  function renderCourse() {
-    const b = board();
-    if (b.kind === "demo") { location.hash = "#courses"; return; }
-    const g = geo(), c = getCourse(b.courseKey);
-    const ids = Object.keys(S.holes).sort((x, y) => S.holes[x].ref - S.holes[y].ref), par = ids.reduce((a, id) => a + S.holes[id].par, 0);
-    const guessed = g ? g.loop.holes.filter(h => h.parSource === "guess").length : 0;
-    view.innerHTML = `<div class="screen">
-      <div class="map-top"><div style="min-width:0"><div class="eyebrow">${b.kind === "manual" ? "Set up by hand" : c && c.source === "snapshot" ? "OSM snapshot" : "Synced from OpenStreetMap"}</div><h1 class="h1" style="font-size:24px;margin-top:4px">${esc(shortName(b.name))}</h1></div><a class="icon-btn" href="#courses">${ic("close")}</a></div>
-      <div class="legend"><span class="chip">${ids.length} holes</span><span class="chip">Par ${par}</span>${g ? `<span class="chip">${g.loop.holes.reduce((a, h) => a + h.yards, 0).toLocaleString()} yds</span><span class="chip">${g.F.greens.length} greens · ${g.F.bunkers.length} bunkers</span>` : ""}</div>
-      ${g ? `<div class="course-wrap" id="cwrap">${courseSvg(g, 366, 430)}<a class="board-note osm" href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap contributors</a></div>
-        <div class="map-tip">${ic("flag")}<span>Tap a hole number to play it. Colors = who owns it in the game.</span></div>`
-        : `<div class="need" style="margin:12px 16px 0">No hole map for this course, so no GPS yardages. Score entry and the territory game still work. Pick your hole by hand.</div>`}
-      ${guessed ? `<div class="need" style="margin:12px 16px 0">${guessed} par${guessed > 1 ? "s aren't" : " isn't"} in OpenStreetMap, so they're guessed from length. <a class="link" href="#" id="fixpar">Check pars</a></div>` : ""}
-      <div class="cta-row"><a class="btn primary" style="flex:1.2" href="#play">${ic("flag")}Play with GPS</a><a class="btn ghost" style="flex:1" href="#map">Territory</a></div>
-      <div class="pad" style="margin-top:10px"><button class="btn ghost block" id="pars">Edit pars</button></div>
+  // ---------- INVITE (host) ----------
+  const inviteLink = m => location.href.split("#")[0].split("?")[0] + "#join/" + m.net.hostId;
+  function qrSvg(text) {
+    const q = qrcode(0, "M"); q.addData(text); q.make();
+    const n = q.getModuleCount(); let d = "";
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (q.isDark(r, c)) d += `M${c} ${r}h1v1h-1z`;
+    return `<svg viewBox="-3 -3 ${n + 6} ${n + 6}" shape-rendering="crispEdges" role="img" aria-label="QR code for the invite link"><rect x="-3" y="-3" width="${n + 6}" height="${n + 6}" rx="3" fill="#fff"/><path d="${d}" fill="#050706"/></svg>`;
+  }
+  function renderInvite() {
+    const m = M();
+    if (!synced(m) || m.net.role !== "host") { location.hash = m ? "#play" : "#home"; return; }
+    const b = mBoard(m), link = inviteLink(m), guests = m.players.filter(p => p.id !== "p1"), live = NET.status().state === "live";
+    const all = guests.every(p => m.seats && m.seats[p.id]);
+    view.innerHTML = `<div class="screen invite">
+      ${header("Invite your rival", esc(shortName(b.name)), `<a class="icon-btn" href="#play" aria-label="Close">${ic("close")}</a>`)}
+      <div class="qr-card"><div class="qr-glow"></div><div class="qr">${qrSvg(link)}</div>
+        <div class="qr-cap"><b>Scan to join</b><span>Point ${esc(guests.map(p => p.name).join(" or "))}'s camera here. No app or account needed.</span></div></div>
+      <div class="link-row"><input readonly value="${esc(link)}" aria-label="Invite link" id="invlink"><button class="btn ghost small" id="cpy">${ic("copy")}Copy</button>${navigator.share ? `<button class="btn ghost small" id="shr">${ic("share")}</button>` : ""}</div>
+      <div class="seats list">${guests.map(p => { const j = m.seats && m.seats[p.id];
+        return `<div class="li"><i class="pdot lg" style="background:${p.color}"></i><div class="li-main"><b>${esc(p.name)}</b><span>${j ? (live ? "Joined · connected" : "Joined · reconnecting") : "Not joined yet"}</span></div>${j ? `<span class="ok-ic">${ic("check")}</span>` : `<div class="spinner"></div>`}</div>`; }).join("")}</div>
+      <div class="pad mt8" data-net>${netChipHtml()}</div>
+      <p class="fineprint">Phones link directly (peer to peer) once both are online. Keep this phone's app open until your rival joins. Scores are saved on both phones, so a dropped signal just catches up later.</p>
+      <div class="sticky col"><a class="btn primary big block" href="#play">${all ? `Tee off · hole ${b.holes[m.cur].ref}` : "Start now, they can join any time"}</a><button class="btn ghost block" id="tolocal">Play on one phone instead</button></div>
     </div>`;
-    view.querySelectorAll(".cm-hole").forEach(el => el.addEventListener("click", () => { GPS.setHole(el.dataset.h); playHole = el.dataset.h; playStrokes = null; tapPt = null; location.hash = "#play"; }));
-    $("#pars").onclick = parSheet; const fp = $("#fixpar"); if (fp) fp.onclick = e => { e.preventDefault(); parSheet(); };
+    $("#cpy").onclick = async () => { try { await navigator.clipboard.writeText(link); toast("Invite link copied."); } catch (e) { $("#invlink").select(); toast("Long-press to copy the link."); } };
+    const sh = $("#shr"); if (sh) sh.onclick = () => navigator.share({ title: "Fairway Conquest", text: `Join my match at ${shortName(b.name)}`, url: link }).catch(() => {});
+    $("#tolocal").onclick = () => { NET.stop(); m.mode = "local"; delete m.net; save(); location.hash = "#play"; };
   }
 
-  // ---------- PLAY (on-course GPS) ----------
-  function renderPlay() {
-    const b = board();
-    if (b.kind === "demo") {
-      view.innerHTML = `<div class="screen"><div class="map-top"><div><div class="eyebrow">On-course mode</div><h1 class="h1" style="font-size:26px;margin-top:4px">Play</h1></div></div>
-        <div class="empty"><div class="empty-ic">${ic("flag", "#FF6A2B")}</div><h2 class="h2">Sync a real course first</h2><p>The demo board is fictional, so there's nothing to GPS. Grab your course from OpenStreetMap.</p><a class="btn primary block" href="#courses">${ic("map")}Find a course</a></div></div>`;
+  // ---------- JOIN (guest) ----------
+  let pendingJoin = null;   // {hostId, match, board, course, seat}
+  function renderJoin(hostId) {
+    const m = M();
+    if (!hostId) { location.hash = "#home"; return; }
+    if (m && m.net && m.net.hostId === hostId) { netBoot(); location.hash = m.done ? "#result" : "#play"; return; }   // rejoin
+    if (!pendingJoin || pendingJoin.hostId !== hostId) { pendingJoin = { hostId }; NET.join(hostId); }
+    paintJoin();
+  }
+  function paintJoin() {
+    const pj = pendingJoin; if (!pj) return;
+    if (!pj.match) {
+      const s = NET.status();
+      view.innerHTML = `<div class="screen join wait"><div class="join-bg" aria-hidden="true"></div>
+        <div class="join-wait"><div class="spinner big"></div><div class="eyebrow sun">Invite</div><h1 class="h1">Finding the match…</h1>
+        <p class="muted">${esc(s.detail || "Connecting to your friend's phone.")}</p><p class="muted sm">Ask the host to keep Fairway Conquest open on their phone.</p>
+        <a class="btn ghost" href="#home">Cancel</a></div></div>`;
       return;
     }
-    const ids = Object.keys(S.holes).sort((x, y) => S.holes[x].ref - S.holes[y].ref);
-    if (!playHole || !S.holes[playHole]) playHole = GPS.D.holeId && S.holes[GPS.D.holeId] ? GPS.D.holeId : ids[0];
-    view.innerHTML = `<div class="screen play" id="play"></div>`;
-    paintPlay(true);
+    const R = pj.match, b = pj.board || S.boards[R.boardKey], host = R.players[0];
+    if (R.done) { view.innerHTML = `<div class="screen">${header("Match over")}${emptyState("That match is finished", "Ask your friend to start a new one and send a fresh code.", "#home", "OK")}</div>`; return; }
+    const open = R.players.filter(p => p.id !== "p1" && (!(R.seats || {})[p.id] || R.seats[p.id] === S.dev));
+    if (!open.length) { view.innerHTML = `<div class="screen">${header("Match is full")}${emptyState("Every seat is taken", "Ask the host to add a player for you.", "#home", "OK")}</div>`; return; }
+    const seat = pj.seat && open.some(p => p.id === pj.seat) ? pj.seat : open[0].id, sp = R.players.find(p => p.id === seat);
+    const stakeTxt = R.stake.type === "none" ? "No stakes" : [R.stake.type !== "match" ? `$${R.stake.hole} a hole` : "", R.stake.type !== "hole" ? `$${R.stake.match} match` : ""].filter(Boolean).join(" + ") + " · tracking only";
+    view.innerHTML = `<div class="screen join">
+      <div class="join-hero"><div class="join-bg" aria-hidden="true"></div>
+        <div class="eyebrow sun">You're invited</div>
+        <h1 class="hero-title">${esc(host.name)} wants<br><span>the course.</span></h1>
+        <div class="join-meta"><span>${ic("pin")}${esc(shortName(b ? b.name : "A real course"))}</span><span>${ic("flag")}${R.holes.length} holes</span><span>${ic("dollar")}${esc(stakeTxt)}</span></div>
+        <div data-net class="mt8">${netChipHtml()}</div></div>
+      ${open.length > 1 ? `<div class="step"><span class="step-n">1</span><h2 class="h2">Who are you?</h2></div><div class="list">${open.map(p => `<button class="li pick ${p.id === seat ? "sel" : ""}" data-seat="${p.id}"><i class="pdot lg" style="background:${p.color}"></i><div class="li-main"><b>${esc(p.name)}</b></div><span class="radio"></span></button>`).join("")}</div>` : ""}
+      <div class="step"><span class="step-n">${open.length > 1 ? 2 : 1}</span><h2 class="h2">Your name</h2></div>
+      <div class="list"><div class="li pl"><i class="pdot lg" style="background:${sp.color}"></i><input id="jname" value="${esc(sp.name)}" placeholder="Your name" maxlength="16" autocomplete="given-name"></div></div>
+      <div class="step"><span class="step-n">${open.length > 1 ? 3 : 2}</span><h2 class="h2">Golf tips <span class="opt">optional</span></h2></div>
+      ${emailCard("join", { noButton: true, hideDone: true, eyebrow: "Free · optional" }) || `<div class="tips card done">${ic("check")}<div><b>You're on Sam's list.</b><span>Nothing else needed.</span></div></div>`}
+      <div class="sticky"><button class="btn primary big block" id="dojoin">Join the match</button></div>
+    </div>`;
+    view.querySelectorAll("[data-seat]").forEach(x => x.onclick = () => { pj.seat = x.dataset.seat; paintJoin(); });
+    $("#dojoin").onclick = () => doJoin(seat);
   }
-  function paintPlay(full) {
-    const root = $("#play"); if (!root) return;
-    const g = geo(), b = board(), G = GPS.G;
-    const ids = Object.keys(S.holes).sort((x, y) => S.holes[x].ref - S.holes[y].ref);
-    if (!playHole || !S.holes[playHole]) playHole = ids[0];
-    const h = S.holes[playHole], gh = geoHole(g, playHole);
-    const rnd = (S.round[S.active] = S.round[S.active] || {});
-    if (playStrokes == null) playStrokes = rnd[playHole] ?? h.par;
-    // yardages
-    let yds = null, fromTee = true;
-    if (gh) {
-      const usable = lastFix && !lastFix.offCourse && OSM.polyDist(lastFix.P, gh.pts) < 300;
-      const Pm = usable ? lastFix.P : gh.tee; fromTee = !usable;
-      yds = OSM.greenYardages(Pm, gh.green, gh.gC);
-      if (tapPt) yds.tap = OSM.dist2(Pm, tapPt);
+  async function doJoin(seat) {
+    const pj = pendingJoin, R = JSON.parse(JSON.stringify(pj.match)), b = pj.board || S.boards[R.boardKey];
+    const name = ($("#jname").value || "").trim().slice(0, 16);
+    const f = view.querySelector("form[data-tips]");
+    if (f) { const { first, email } = readTips(f); if (email) { if (validEmail(email)) addSignup(first || name, email, "join"); else toast("Email skipped: it didn't look right."); } }
+    if (b) S.boards[b.key] = b;
+    if (pj.course) saveCourse(pj.course);
+    else if (b && b.kind === "osm" && !getCourse(b.courseKey)) {
+      const q = QUICK.find(x => `${x.type}/${x.id}` === b.courseKey);
+      if (q) { try { const r = await fetch(`data/${q.type}-${q.id}.json`); saveCourse(OSM.parseCourse(await r.json(), { key: b.courseKey, name: q.name, area: q.area, source: "snapshot" })); } catch (e) {} }
     }
-    const posted = rnd[playHole] != null;
-    const r = playStrokes - h.par, need = needToTake(h), o = h.owner && P(h.owner);
-    const lk = locked(playHole);
-    let line;
-    if (!h.owner) line = `<b>Open hole.</b> Any score claims it.`;
-    else if (h.owner === "me") line = `<b>You hold it</b> with ${h.strokes}.`;
-    else line = `<b>${esc(o.name)}</b> holds it with ${h.strokes}${buffer(h) ? ` +${buffer(h)} fort` : ""}. Need <b>${need.strokes}</b>.`;
-    const verdictCol = h.owner === "me" ? "var(--muted)" : !h.owner || r < need.target ? "#2FA36A" : r === need.target ? "#FFB13B" : "#F2577A";
-    const thru = Object.keys(rnd).filter(k => S.holes[k]), tot = thru.reduce((a, k) => a + rnd[k] - S.holes[k].par, 0);
-    const gpsChip = G.mode === "off" ? `<button class="gps-chip off" id="gpson">${ic("eye")}GPS off</button>`
-      : G.error && !G.fix ? `<button class="gps-chip warn" id="gpson">${ic("alert")}${esc(G.error)}</button>`
-      : !G.fix ? `<span class="gps-chip">${ic("eye")}Finding you…</span>`
-      : `<button class="gps-chip ${G.fix.acc <= 10 ? "good" : G.fix.acc <= 25 ? "ok" : "warn"}" id="gpsinfo"><i></i>${G.fix.sim ? "SIM · " : ""}±${Math.round(G.fix.acc)} m</button>`;
+    if (name) R.players.find(p => p.id === seat).name = name;
+    R.seats = R.seats || {}; R.seats[seat] = S.dev;
+    R.net = { role: "guest", hostId: pj.hostId, myPid: seat };
+    S.match = R; R.cur = nextMine(R) || R.holes[0]; S.onboarded = true; playEdit = null; save();
+    NET.send({ t: "claim", pid: seat, dev: S.dev, name });
+    pendingJoin = null; geo._k = null;
+    location.hash = "#play";
+  }
+
+  // ---------- PLAY (hole entry) ----------
+  let playEdit = null;   // {holeId, vals:{pid:n}} while entering
+  function editVals(m, hid) {
+    if (!playEdit || playEdit.hole !== hid) {
+      const par = mBoard(m).holes[hid].par, sc = m.scores[hid] || {};
+      playEdit = { hole: hid, vals: Object.fromEntries(m.players.map(p => [p.id, sc[p.id] ?? par])) };
+    }
+    return playEdit.vals;
+  }
+  function holeStatus(m, r, hid) {
+    const o = r.owner[hid], sc = m.scores[hid];
+    if (o) return `${dot(pl(o))}<span><b>${esc(pl(o).name)}</b> ${r.how[hid] === "stolen" ? "stole it" : "owns it"}${holeDone(m, hid) ? "" : " · win it back"}</span>`;
+    if (holeDone(m, hid) && r.events.find(e => e.hole === hid && e.tie)) return `<span>Halved. Nobody owns it.</span>`;
+    if (synced(m) && sc && sc[myPid(m)] != null) return `<span><b>Your ${sc[myPid(m)]} is in.</b> Waiting on ${esc(m.players.filter(p => sc[p.id] == null).map(p => p.name).join(", "))}.</span>`;
+    return `<span><b>Open hole.</b> Low score claims it. Win by 2+ to steal a neighbor.</span>`;
+  }
+  function entryRows(m, hid, big = false) {
+    const par = mBoard(m).holes[hid].par, vals = editVals(m, hid), sy = synced(m), me = myPid(m), sc = m.scores[hid] || {};
+    return m.players.map(p => {
+      if (sy && p.id !== me) {
+        const v = sc[p.id];
+        return `<div class="entry ro ${big ? "big" : ""}" style="--pc:${p.color}"><div class="e-name">${dot(p)}<span>${esc(p.name)}</span><em>their phone</em></div>
+          <div class="ro-val">${v != null ? `<b>${v}</b><span>${scoreName(v, par)}</span>` : `<i class="dots"><s></s><s></s><s></s></i><span>Waiting</span>`}</div></div>`;
+      }
+      return `<div class="entry ${big ? "big" : ""}" style="--pc:${p.color}"><div class="e-name">${dot(p)}<span>${esc(p.name)}</span>${sy ? "<em>you</em>" : ""}</div>
+      <button class="sbtn" data-dec="${p.id}" aria-label="Minus">−</button>
+      <div class="sval"><b>${vals[p.id]}</b><span>${scoreName(vals[p.id], par)}</span></div>
+      <button class="sbtn" data-inc="${p.id}" aria-label="Plus">+</button></div>`; }).join("");
+  }
+  function bindEntry(root, m, hid) {
+    const par = mBoard(m).holes[hid].par, vals = editVals(m, hid);
+    root.querySelectorAll("[data-dec]").forEach(x => x.onclick = () => { const k = x.dataset.dec; if (vals[k] > 1) { vals[k]--; repaint(false); } });
+    root.querySelectorAll("[data-inc]").forEach(x => x.onclick = () => { const k = x.dataset.inc; if (vals[k] < par + 6) { vals[k]++; repaint(false); } });
+    root.querySelectorAll("[data-save]").forEach(x => x.onclick = () => saveHole(m, hid));
+    root.querySelectorAll("[data-hs]").forEach(x => x.onclick = () => { m.cur = x.dataset.hs; GPS.setHole(m.cur); playEdit = null; tapPt = null; save(); repaint(); });
+  }
+  function holeStrip(m, r) {
+    return m.holes.map(id => { const o = r.owner[id], p = o && pl(o), done = holeDone(m, id), half = !done && !!m.scores[id];
+      return `<button class="hs ${id === m.cur ? "cur" : ""} ${done ? "done" : ""} ${half ? "half" : ""}" data-hs="${id}" style="--oc:${p ? p.color : "transparent"}">${id.slice(1)}</button>`; }).join("");
+  }
+  function saveHole(m, hid) {
+    const vals = editVals(m, hid), sy = synced(m), me = myPid(m);
+    m.players.forEach(p => { if (!sy || p.id === me) setCell(m, hid, p.id, vals[p.id]); });
+    if (!m.log.includes(hid)) m.log.push(hid);
+    ordLog(m);
+    const r = resolve(m), ev = r.events.find(e => e.hole === hid), complete = holeDone(m, hid);
+    playEdit = null;
+    const nxt = nextMine(m); if (nxt) m.cur = nxt;
+    save(); pushState();
+    if (complete) showHoleResult(m, hid, ev, r, r.complete);
+    else { toast(`Saved. Waiting on ${esc(m.players.filter(p => m.scores[hid][p.id] == null).map(p => p.name).join(", "))}.`); repaint(); }
+  }
+  function showHoleResult(m, hid, ev, r, last) {
+    const h = mBoard(m).holes[hid], w = ev && ev.winner && pl(ev.winner);
+    const stake = (m.stake.type === "hole" || m.stake.type === "both") && w ? `<div class="res-money">${ic("dollar")}<span>+$${m.stake.hole * (m.players.length - 1)} to ${esc(w.name)}</span><em>tracking only</em></div>` : "";
+    const nx = mBoard(m).holes[m.cur];
+    overlayRoot.innerHTML = `<div class="cap" style="--pc:${w ? w.color : "#8a948a"}"><div class="cap-rays"></div><div class="cap-glow"></div>
+      <div class="cap-body">
+        <svg class="cap-hex" viewBox="0 0 120 130"><defs><filter id="capf" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>
+          <polygon points="${hexPts(60, 65, 50)}" fill="${w ? w.color : "rgba(255,255,255,.08)"}" fill-opacity="${w ? .9 : 1}" stroke="${w ? "#fff" : "rgba(255,255,255,.5)"}" stroke-opacity=".7" stroke-width="2.5" filter="url(#capf)"/>
+          <text x="60" y="80" text-anchor="middle" font-size="44" font-weight="900" font-style="italic" fill="${w ? w.ink : "#fff"}">${h.ref}</text></svg>
+        <div class="eyebrow">${w ? (ev.retook ? "Taken back" : "Captured") : "Halved"}</div>
+        <h2 class="cap-title">${w ? `${esc(w.name)} takes <span>#${h.ref}</span>` : `#${h.ref} stays open`}</h2>
+        <p class="cap-scores">${m.players.map(p => `<span style="--pc:${p.color}">${dot(p)}${esc(p.name)} <b>${m.scores[hid][p.id]}</b></span>`).join("")}</p>
+        ${ev && ev.steal ? `<div class="res-steal">${ic("swords")}<span><b>Won by ${ev.margin}. Steal!</b> ${esc(w.name)} also grabs #${ev.steal.slice(1)} from ${esc(pl(ev.stoleFrom).name)}.</span></div>` : ""}
+        ${stake}
+        ${scoreboard(m, r)}
+        <button class="btn primary big block" id="cap-ok">${last ? "See the result" : nx && !holeDone(m, m.cur) ? `Hole ${nx.ref} →` : "Back to the match"}</button>
+      </div></div>`;
+    $("#cap-ok").onclick = () => { overlayRoot.innerHTML = ""; if (last) finishMatch(); else repaint(); };
+  }
+  function renderPlay() {
+    const m = M();
+    if (!m) { view.innerHTML = `<div class="screen">${header("Play")}${emptyState("No match running", "Start one, pick a course, add a friend.", "#new", "New match")}</div>`; return; }
+    if (m.done) { location.hash = "#result"; return; }
+    view.innerHTML = `<div class="play" id="play"></div>`;
+    paintPlay();
+  }
+  /** The live hole: a floating 3D slab of the real hole map, rimmed in the owner's glow (green = you, gold = rival). */
+  function paintPlay() {
+    const root = $("#play"); if (!root) return;
+    const m = M(), b = mBoard(m), r = resolve(m), hid = m.cur, h = b.holes[hid], y = yardsFor(hid), g = geo(), gh = geoHole(g, hid);
+    const own = r.owner[hid] && pl(r.owner[hid]), glow = own ? own.color : "rgba(190,255,220,.55)";
+    const mine = synced(m) ? (m.scores[hid] || {})[myPid(m)] != null : !!m.scores[hid];
     root.innerHTML = `
-      <div class="play-top"><div style="min-width:0"><div class="eyebrow">${esc(shortName(b.name))}</div>
-        <div class="hole-title"><b>Hole ${h.ref}</b><span>Par ${h.par}${h.yards ? `<br>${h.yards} yds` : ""}</span></div></div>
-        <div class="top-actions">${g ? gpsChip : ""}<button class="icon-btn ${S.outdoor ? "on" : ""}" id="outdoor" aria-label="Outdoor mode">${ic("sun")}</button></div></div>
-      <div class="hole-strip" id="strip">${g ? `<button class="hs auto ${GPS.D.auto ? "on" : ""}" id="auto">AUTO</button>` : ""}${ids.map(id => `<button class="hs ${id === playHole ? "cur" : ""} ${rnd[id] != null ? "done" : ""}" data-hs="${id}" style="--oc:${S.holes[id].owner ? P(S.holes[id].owner).color : "transparent"}">${S.holes[id].ref}</button>`).join("")}</div>
-      ${gh ? `<div class="yards">
-        <div class="yd side"><span>Front</span><b>${yds.front == null ? "—" : yd(yds.front)}</b></div>
-        <div class="yd main"><span>${fromTee ? "Center · from tee" : "Center"}</span><b>${yd(yds.center)}</b></div>
-        <div class="yd side"><span>Back</span><b>${yds.back == null ? "—" : yd(yds.back)}</b></div></div>`
-        : `<div class="yards none"><b>No map for this hole</b><span>Yardages need the hole mapped in OpenStreetMap. Scoring still works.</span></div>`}
-      <div class="hole-wrap" id="hwrap">${gh ? "" : `<div class="nomap">${hexSvg(ownerColor(h), h.ref, { sub: "PAR " + h.par, w: 120, h: 130 })}</div>`}
-        ${gh ? `<div class="map-hint">${tapPt ? `<b>${yd(yds.tap)}</b> to tap · tap again to move` : "Tap the map to measure"}</div><div class="map-tools"><button class="icon-btn" id="tocourse" aria-label="Course map">${ic("map")}</button>${tapPt ? `<button class="icon-btn" id="clrtap" aria-label="Clear">${ic("close")}</button>` : ""}</div>` : ""}
-        ${gh ? `<div class="osm-attr">© OpenStreetMap</div>` : `<div class="map-hint">Pick your hole above. No map, so no auto-detect.</div>`}</div>
-      <div class="score-card">
-        <div class="score-line"><span>${line}</span><span class="thru">${thru.length ? `Thru ${thru.length} · ${tot === 0 ? "E" : tot > 0 ? "+" + tot : tot}` : "Round not started"}</span></div>
-        <div class="score-row">
-          <button class="sbtn" id="sminus" ${posted ? "disabled" : ""}>−</button>
-          <div class="sval"><b style="color:${posted ? "var(--cream)" : verdictCol}">${playStrokes}</b><span>${scoreName(playStrokes, h.par)}</span></div>
-          <button class="sbtn" id="splus" ${posted ? "disabled" : ""}>+</button>
-          <button class="spost ${posted ? "done" : ""}" id="spost">${posted ? `${ic("check")}Posted` : lk ? `${ic("lock")}Unlock` : `${ic("flag")}Post`}</button>
-        </div>
-        <div class="score-opts"><button class="mini-opt" id="partner">${ic("users")}Verify: ${S.partner === "none" ? "none" : esc(P(S.partner).name)}</button>${g ? `<button class="mini-opt" id="sim">${ic("redo")}${G.mode === "sim" ? "Stop sim" : "Simulate GPS"}</button>` : `<a class="mini-opt" href="#course">${ic("map")}Edit pars</a>`}</div>
-      </div>`;
-    // map
+      <div class="play-top"><div style="min-width:0"><div class="eyebrow">${esc(shortName(b.name))}</div></div>
+        <div class="hdr-r">${g ? gpsChip() : ""}<a class="icon-btn" href="#cart" aria-label="Cart display">${ic("cart")}</a><button class="icon-btn" id="pmenu" aria-label="Match menu">${ic("more")}</button></div></div>
+      ${scoreboard(m, r)}
+      ${synced(m) ? `<div class="play-net" data-net>${netChipHtml()}</div>` : ""}
+      <div class="hole-strip" id="strip">${holeStrip(m, r)}</div>
+      <div class="stage ${own ? "owned" : "open"}" style="--gc:${glow}">
+        <div class="hole-title"><b>Hole ${h.ref}</b><span>Par ${h.par}${h.yards ? ` · ${h.yards} yds` : ""}</span>${own ? `<em style="color:${own.color}">${esc(own.name)}'s</em>` : `<em>Open</em>`}</div>
+        <div class="stage-glow"></div>
+        ${gh ? `<div class="slab-wrap"><div class="slab">${"<i></i>".repeat(6)}<div class="slab-top" id="slab"></div></div></div>` : `<img class="diorama" src="assets/hole-diorama.webp" alt="" width="720" height="458">`}
+        ${y ? `<div class="yards"><div class="yd main"><b>${yd(y.center)}</b><span>yds<br><em>${y.fromTee ? "from tee" : "to green"}</em></span></div>
+          <div class="yd-fb"><div class="yd side"><span>Back</span><b>${y.back == null ? "—" : yd(y.back)}</b></div><div class="yd side"><span>Front</span><b>${y.front == null ? "—" : yd(y.front)}</b></div></div></div>` : ""}
+      </div>
+      <div class="status">${holeStatus(m, r, hid)}</div>
+      <div class="entries">${entryRows(m, hid)}</div>
+      <button class="btn primary big block save" data-save>${mine ? (synced(m) ? "Update my score" : "Update hole " + h.ref) : (synced(m) ? "Lock in my score" : "Save hole " + h.ref)}</button>
+      <div class="play-foot">${g ? `<button class="mini" id="sim">${ic("redo")}${GPS.G.mode === "sim" ? "Stop GPS sim" : "Simulate GPS"}</button>` : ""}<a class="mini" href="#map">${ic("map")}Territory</a>${m.stake.type !== "none" ? `<a class="mini" href="#stakes">${ic("dollar")}Stakes</a>` : ""}</div>`;
+    if (gh) { const el = $("#slab"); el.innerHTML = holeSvg(g, gh, 230, 300, { bg: "#173a24" }).svg; }
+    bindEntry(root, m, hid); bindGps(root);
+    const strip = $("#strip"), cur = strip.querySelector(".cur"); if (cur) strip.scrollLeft = Math.max(0, cur.offsetLeft - (strip.clientWidth - cur.offsetWidth) / 2);
+    const sim = $("#sim"); if (sim) sim.onclick = () => { if (GPS.G.mode === "sim") { GPS.stop(); toast("Simulation stopped."); return; } GPS.setAuto(true); GPS.D.holeId = m.cur; GPS.startSim(simPath(g, m.cur), { metersPerTick: 20, ms: 1000 }); toast("Simulating GPS along the real hole."); };
+    $("#pmenu").onclick = () => matchMenu(m);
+  }
+  function matchMenu(m) {
+    sheet(`<h2 class="h1 sm">Match</h2><div class="list flush">
+      ${synced(m) && m.net.role === "host" ? `<a class="li" href="#invite"><div class="li-ic">${ic("qr")}</div><div class="li-main"><b>Invite code</b><span>Show the QR again</span></div>${ic("chev")}</a>` : ""}
+      ${synced(m) ? `<div class="li"><div class="li-ic">${ic("wifi")}</div><div class="li-main"><b>Live link</b><span data-net>${netChipHtml()}</span></div></div>` : ""}
+      <a class="li" href="#map"><div class="li-ic">${ic("map")}</div><div class="li-main"><b>Territory map</b><span>Who owns what</span></div>${ic("chev")}</a>
+      <a class="li" href="#stakes"><div class="li-ic">${ic("dollar")}</div><div class="li-main"><b>Stakes</b><span>${m.stake.type === "none" ? "None set" : "Ledger and settle-up"}</span></div>${ic("chev")}</a>
+      <button class="li" id="sout"><div class="li-ic">${ic("sun")}</div><div class="li-main"><b>Outdoor mode</b><span>${S.outdoor ? "On" : "Off"} · max contrast in full sun</span></div></button>
+      <button class="li" id="mend"><div class="li-ic">${ic("trophy")}</div><div class="li-main"><b>End match now</b><span>Settle on the holes played so far</span></div></button></div>`);
+    $("#sout").onclick = () => { S.outdoor = !S.outdoor; save(); applyOutdoor(); closeSheet(); repaint(); };
+    $("#mend").onclick = () => { closeSheet(); finishMatch(); };
+  }
+  function recordHistory(m) {
+    if (S.history.some(x => x.id === m.id)) return;
+    const r = resolve(m), b = mBoard(m), lead = r.leader;
+    const owe = settle(r.net).map(s => `${pl(s.from).name} → ${pl(s.to).name} ${money(s.amt)}`).join(", ");
+    S.history.unshift({ id: m.id, title: lead ? `${lead.name} took ${shortName(b.name)}` : `Split ${shortName(b.name)}`, sub: `${r.table.map(t => t.holes).join("–")} holes · ${m.players.map(p => p.name).join(" v ")}`,
+      money: owe, color: lead ? lead.color : "#2a312b", ink: lead ? lead.ink : "#fff" });
+    S.history = S.history.slice(0, 20); save();
+  }
+  function finishMatch() {
+    const m = M();
+    if (!m.done) { m.done = true; recordHistory(m); save(); pushState(); }
+    location.hash = "#result";
+  }
+
+  // ---------- MAP ----------
+  let mapView = "hex";
+  function renderMap() {
+    const m = M();
+    if (!m) { view.innerHTML = `<div class="screen">${header("Territory")}${emptyState("No territory yet", "Start a match and every hole you win turns your color.", "#new", "New match")}</div>`; return; }
+    const r = resolve(m), b = mBoard(m), g = geo();
+    if (!g) mapView = "hex";
+    view.innerHTML = `<div class="screen terr">
+      ${header("Territory", `${esc(shortName(b.name))} · ${m.done ? "final" : `${r.played.length}/${m.holes.length} played`}`, tally(m, r))}
+      ${scoreboard(m, r, true)}
+      ${g ? `<div class="pad mt8"><div class="seg" id="mv"><button class="${mapView === "hex" ? "on" : ""}" data-v="hex">Board</button><button class="${mapView === "course" ? "on" : ""}" data-v="course">Course</button></div></div>` : ""}
+      <div class="board-card ${mapView} ${mapView === "hex" ? "terrain" : ""}">${mapView === "hex" ? hexBoard(m) : courseSvg(g, m, 366, 440)}
+        ${synced(m) ? `<div class="board-net" data-net>${netChipHtml()}</div>` : ""}</div>
+      <div class="legend">${m.players.map(p => `<span>${dot(p)}${esc(p.name)}</span>`).join("")}<span><i class="pdot open"></i>Open</span><span class="stolen-k">${ic("redo")}Stolen</span></div>
+      ${rulesCard()}
+      ${m.done ? `<div class="pad mt16"><a class="btn primary block" href="#result">See the result</a></div>` : `<div class="pad mt16"><a class="btn primary block" href="#play">Back to hole ${b.holes[m.cur].ref}</a></div>`}
+    </div>`;
+    const mv = $("#mv"); if (mv) mv.querySelectorAll("button").forEach(x => x.onclick = () => { mapView = x.dataset.v; renderMap(); });
+    view.querySelectorAll("[data-hx]").forEach(x => x.onclick = () => holeSheet(m, x.dataset.hx));
+  }
+  function holeSheet(m, hid) {
+    const r = resolve(m), h = mBoard(m).holes[hid], sc = m.scores[hid], o = r.owner[hid];
+    sheet(`<div class="eyebrow">Hole ${h.ref} · Par ${h.par}${h.yards ? ` · ${h.yards} yds` : ""}</div><h2 class="h1 sm">${o ? `${esc(pl(o).name)} ${r.how[hid] === "stolen" ? "stole it" : "owns it"}` : holeDone(m, hid) ? "Halved" : sc ? "In progress" : "Not played yet"}</h2>
+      ${sc ? `<div class="list flush">${m.players.map(p => `<div class="li"><i class="pdot lg" style="background:${p.color}"></i><div class="li-main"><b>${esc(p.name)}</b><span>${sc[p.id] != null ? scoreName(sc[p.id], h.par) : "Waiting"}</span></div><b class="big-n">${sc[p.id] ?? "—"}</b></div>`).join("")}</div>` : ""}
+      ${m.done ? "" : `<button class="btn primary block mt16" id="goh">${sc ? (synced(m) ? "Edit my score" : "Edit this hole") : "Play this hole"}</button>`}`);
+    const gh = $("#goh"); if (gh) gh.onclick = () => { m.cur = hid; playEdit = null; save(); closeSheet(); location.hash = "#play"; };
+  }
+  const rulesCard = () => `<div class="rules card"><div class="eyebrow">Rules</div>
+    <div class="rule"><b>1</b><span><strong>Win a hole, claim it.</strong> Low score takes the territory. Ties stay open.</span></div>
+    <div class="rule"><b>2</b><span><strong>Win by 2+, steal one.</strong> Also grab a rival hole that touches it on the board.</span></div>
+    <div class="rule"><b>3</b><span><strong>Most holes takes the course.</strong> Tied? Fewest total strokes.</span></div></div>`;
+
+  // ---------- STAKES ----------
+  function renderStakes() {
+    const m = M();
+    if (!m) { view.innerHTML = `<div class="screen">${header("Stakes")}${emptyState("No match running", "Set a per-hole or match stake when you start one.", "#new", "New match")}</div>`; return; }
+    const r = resolve(m), st = settle(r.net);
+    const STEPS = [1, 2, 5, 10, 20, 25, 50, 100];
+    view.innerHTML = `<div class="screen">
+      ${header("Stakes", esc(shortName(mBoard(m).name)), `<span class="track-pill">Tracking only</span>`)}
+      ${m.stake.type === "none" ? `<div class="empty card"><div class="empty-ic">${ic("dollar")}</div><b>No stakes on this match</b><p>Add a friendly wager. The app keeps the ledger, you settle up.</p>
+        <div class="row2"><button class="btn ghost" data-st="hole">$5 a hole</button><button class="btn ghost" data-st="match">$20 match</button></div></div>`
+      : `<div class="net">${m.players.map(p => `<div class="net-p" style="--pc:${p.color}">${dot(p)}<span>${esc(p.name)}</span><b class="${r.net[p.id] > 0 ? "up" : r.net[p.id] < 0 ? "down" : ""}">${r.net[p.id] > 0 ? "+" : ""}${money(r.net[p.id])}</b></div>`).join("")}</div>
+        <div class="settle card"><div class="eyebrow">${m.done ? "Settle up" : "If you stopped now"}</div>
+          ${st.length ? st.map(s => `<div class="owe"><span>${esc(pl(s.from).name)}</span>${ic("chev")}<span>${esc(pl(s.to).name)}</span><b>${money(s.amt)}</b></div>`).join("") : `<div class="muted">All square.</div>`}
+          <div class="terms">${m.stake.type !== "match" ? `$${m.stake.hole} per hole won` : ""}${m.stake.type === "both" ? " · " : ""}${m.stake.type !== "hole" ? `$${m.stake.match} to the match winner${m.done ? "" : " (paid at the end)"}` : ""}</div></div>
+        <div class="sect"><h2 class="h2">Ledger</h2><span class="muted sm">${r.ledger.length} entries</span></div>
+        <div class="list">${r.ledger.length ? r.ledger.slice().reverse().map(l => `<div class="li"><div class="li-ic" style="background:${pl(l.to).color};color:${pl(l.to).ink}">${l.hole === "match" ? ic("trophy") : l.hole.slice(1)}</div><div class="li-main"><b>${esc(pl(l.to).name)} ${l.hole === "match" ? "wins the match" : "won #" + l.hole.slice(1)}</b><span>from ${esc(pl(l.from).name)}</span></div><span class="li-amt">+$${l.amt}</span></div>`).join("") : `<div class="li"><div class="li-main"><span>Nothing yet. Win a hole.</span></div></div>`}</div>`}
+      <p class="fineprint">No real money moves in this prototype. Paying out inside the app needs a licensed payments / skill-gaming partner and legal review by state.</p>
+    </div>`;
+    view.querySelectorAll("[data-st]").forEach(x => x.onclick = () => { m.stake = { type: x.dataset.st, hole: 5, match: 20 }; save(); renderStakes(); });
+  }
+
+  // ---------- RESULT ----------
+  function renderResult() {
+    const m = M();
+    if (!m) { location.hash = "#home"; return; }
+    if (!m.done) { finishMatch(); return; }
+    const r = resolve(m), b = mBoard(m), w = r.leader, st = settle(r.net), me = myPid(m);
+    const iWon = w && w.id === me;
+    const toMe = st.filter(s => s.to === me), fromMe = st.filter(s => s.from === me);
+    const sum = a => a.reduce((x, s) => x + s.amt, 0), names = a => a.map(s => pl(s.from === me ? s.to : s.from).name).join(" & ");
+    const owed = toMe.length ? `<div class="owed card"><b>${money(sum(toMe))}</b><span>${esc(names(toMe))} owe${toMe.length > 1 ? "" : "s"} you</span><em>Tracking only</em></div>`
+      : fromMe.length ? `<div class="owed card down"><b>${money(sum(fromMe))}</b><span>You owe ${esc(names(fromMe))}</span><em>Tracking only</em></div>` : "";
+    const title = iWon ? `You took<br><span>the course.</span>` : w ? `${esc(w.name)} took<br><span>the course.</span>` : `Dead even.<br><span>Nobody takes it.</span>`;
+    view.innerHTML = `<div class="screen final" style="--pc:${w ? w.color : "#8a948a"}">
+      <div class="res-hero"><img class="res-trophy" src="assets/trophy.webp" alt="" width="720" height="720"><div class="res-fade"></div>
+        <div class="eyebrow sun">${esc(shortName(b.name))} · Final</div>
+        <h1 class="res-title">${title}</h1>
+        <p class="res-tally">${tally(m, r)}<span>holes</span></p></div>
+      ${owed}
+      <div class="board-card hex sm terrain">${hexBoard(m, { noCur: true })}</div>
+      <div class="stats card">${r.table.map(t => `<div class="stat-r" style="--pc:${t.color}">${dot(t)}<b>${esc(t.name)}</b><span>${t.holes} holes</span><span>${t.strokes} (${rel(t.toPar)})</span><span>${t.steals} steal${t.steals === 1 ? "" : "s"}</span></div>`).join("")}</div>
+      ${m.stake.type !== "none" ? `<div class="settle card"><div class="eyebrow">Settle up · tracking only</div>${st.length ? st.map(s => `<div class="owe"><span>${esc(pl(s.from).name)}</span>${ic("chev")}<span>${esc(pl(s.to).name)}</span><b>${money(s.amt)}</b></div>`).join("") : `<div class="muted">All square.</div>`}<div class="terms">Pay each other however you like. No money moves in the app.</div></div>` : ""}
+      <div class="pad mt16 col"><button class="btn primary big block" id="rematch">${ic("redo")}Rematch</button><button class="btn ghost block" id="rdone">Done</button></div>
+    </div>`;
+    $("#rematch").onclick = () => { const d = { boardKey: m.boardKey, range: S.draft.range, players: m.players.map(p => ({ name: p.name })), mode: m.mode, stake: { ...m.stake } };
+      if (synced(m) && m.net.role !== "host") { const mi = m.players.findIndex(p => p.id === me); if (mi > 0) { const x = d.players[0]; d.players[0] = d.players[mi]; d.players[mi] = x; } }
+      newMatch(d); S.match.holes = m.holes.slice(); S.match.cur = S.match.holes[0]; save(); netBoot(); location.hash = synced() ? "#invite" : "#play"; };
+    $("#rdone").onclick = () => { NET.stop(); S.match = null; save(); location.hash = "#home"; };
+  }
+
+  // ---------- CART DISPLAY (landscape course monitor) ----------
+  function renderCart() {
+    app.classList.add("cart");
+    const m = M();
+    if (!m || m.done) {
+      view.innerHTML = `<div class="cartv idle"><div class="idle-bg" aria-hidden="true"></div><button class="cart-exit" id="cx">${ic("close")}Exit cart display</button>
+        <div class="idle-body"><div class="eyebrow sun">Cart display</div><h1 class="res-title">Play your friends.<br><span>Take the course.</span></h1>
+        <p class="muted">Start a match on this screen. Scores, yardage and territory stay up the whole round.</p>
+        <a class="btn primary big" href="#new">${ic("plus")}New match</a></div></div>`;
+      $("#cx").onclick = exitCart; return;
+    }
+    view.innerHTML = `<div class="cartv" id="cartv"></div>`;
+    paintCart();
+  }
+  function paintCart() {
+    const root = $("#cartv"); if (!root) return;
+    const m = M(), b = mBoard(m), r = resolve(m), hid = m.cur, h = b.holes[hid], y = yardsFor(hid), g = geo(), gh = geoHole(g, hid);
+    const own = r.owner[hid] && pl(r.owner[hid]);
+    root.style.setProperty("--gc", own ? own.color : "rgba(190,255,220,.35)");
+    root.innerHTML = `
+      <section class="c-left">
+        <div class="c-brand"><div class="brand-mark">${ic("flag", "#04130a")}</div><span>${esc(shortName(b.name))}</span></div>
+        <div class="c-hole"><span>Hole</span><b>${h.ref}</b><em>Par ${h.par}${h.yards ? ` · ${h.yards} yds` : ""}</em></div>
+        ${y ? `<div class="c-yards"><div class="c-y main"><span>${y.fromTee ? "To green · from tee" : "To green"}</span><b>${yd(y.center)}<small>yds</small></b></div>
+          <div class="c-fb"><div class="c-y"><span>Front</span><b>${y.front == null ? "—" : yd(y.front)}</b></div><div class="c-y"><span>Back</span><b>${y.back == null ? "—" : yd(y.back)}</b></div></div></div>`
+          : `<div class="c-yards none"><b>No GPS map for this hole</b><span>Scoring and territory still work.</span></div>`}
+        <div class="c-gps">${g ? gpsChip() : ""}${g ? `<button class="gps-chip" id="csim">${ic("redo")}${GPS.G.mode === "sim" ? "Stop sim" : "Sim"}</button>` : ""}</div>
+      </section>
+      <section class="c-mid">${gh ? `<div class="c-map ${own ? "owned" : ""}" id="cmap"><div class="c-owner">${own ? `${dot(own)}${esc(own.name)}'s hole` : "Open hole"}</div><div class="osm-attr">© OpenStreetMap</div></div>` : `<div class="c-map hexonly terrain">${hexBoard(m)}</div>`}
+        <div class="hole-strip c-strip">${holeStrip(m, r)}</div></section>
+      <section class="c-right">
+        <div class="c-top"><span class="live-tag"><i></i>Match · ${r.played.length}/${m.holes.length}</span>${synced(m) ? `<span data-net>${netChipHtml()}</span>` : ""}<button class="cart-exit" id="cx">${ic("close")}Exit</button></div>
+        ${scoreboard(m, r, true)}
+        ${gh ? `<div class="c-terr terrain">${hexBoard(m)}</div>` : ""}
+        <div class="status">${holeStatus(m, r, hid)}</div>
+        <div class="entries">${entryRows(m, hid, true)}</div>
+        <button class="btn primary big block save" data-save>${(synced(m) ? (m.scores[hid] || {})[myPid(m)] != null : m.scores[hid]) ? "Update hole " + h.ref : "Save hole " + h.ref}</button>
+      </section>`;
     if (gh) {
-      const wrap = $("#hwrap"), Wp = wrap.clientWidth || 358, Hp = wrap.clientHeight || 260;
-      const hm = holeSvg(g, gh, Wp, Hp);
+      const wrap = $("#cmap"), hm = holeSvg(g, gh, wrap.clientWidth || 480, wrap.clientHeight || 640, { bg: "#10241a" });
       wrap.insertAdjacentHTML("afterbegin", hm.svg);
       const svg = wrap.querySelector("svg");
-      svg.addEventListener("click", e => { const pt = svg.createSVGPoint(); pt.x = e.clientX; pt.y = e.clientY; const q = pt.matrixTransform(svg.getScreenCTM().inverse()); tapPt = hm.Ti([q.x, q.y]); paintPlay(); });
-      const ct = $("#clrtap"); if (ct) ct.onclick = () => { tapPt = null; paintPlay(); };
-      $("#tocourse").onclick = () => { location.hash = "#course"; };
+      svg.addEventListener("click", e => { const pt = svg.createSVGPoint(); pt.x = e.clientX; pt.y = e.clientY; const q = pt.matrixTransform(svg.getScreenCTM().inverse()); tapPt = hm.Ti([q.x, q.y]); paintCart(); });
     }
-    const strip = $("#strip"), cur = strip.querySelector(".cur"); if (cur && full !== false) strip.scrollLeft = Math.max(0, cur.offsetLeft - 120);
-    strip.querySelectorAll("[data-hs]").forEach(x => x.onclick = () => { GPS.setHole(x.dataset.hs); playHole = x.dataset.hs; playStrokes = null; tapPt = null; paintPlay(); });
-    if ($("#auto")) $("#auto").onclick = () => { GPS.setAuto(!GPS.D.auto); if (GPS.D.auto) toast("Auto hole detection on."); paintPlay(); };
-    $("#outdoor").onclick = () => { S.outdoor = !S.outdoor; save(); applyOutdoor(); paintPlay(); toast(S.outdoor ? "Outdoor mode: max contrast for the sun." : "Outdoor mode off."); };
-    const gon = $("#gpson"); if (gon) gon.onclick = () => { if (G.mode === "sim") return; GPS.setAuto(true); GPS.startLive(); };
-    const gi = $("#gpsinfo"); if (gi) gi.onclick = () => toast(G.fix.sim ? "Simulated GPS. Walking the real hole line." : `GPS accuracy ±${Math.round(G.fix.acc)} m. Under 10 m is great.`);
-    $("#sminus").onclick = () => { if (playStrokes > 1) { playStrokes--; paintPlay(); } };
-    $("#splus").onclick = () => { if (playStrokes < h.par + 6) { playStrokes++; paintPlay(); } };
-    $("#partner").onclick = () => { const opts = ["none", ...Object.keys(S.players).filter(p => p !== "me")]; S.partner = opts[(opts.indexOf(S.partner) + 1) % opts.length]; save(); paintPlay(); };
-    if ($("#sim")) $("#sim").onclick = () => {
-      if (G.mode === "sim") { GPS.stop(); toast("Simulation stopped."); return; }
-      if (!g) { toast("Simulation needs a mapped course."); return; }
-      GPS.setAuto(true); GPS.D.holeId = playHole; GPS.startSim(simPath(g, playHole), { metersPerTick: 20, ms: 1000 }); toast("Simulating: walking the real hole line.");
-    };
-    $("#spost").onclick = () => {
-      if (posted) { toast(`Already posted ${rnd[playHole]} on #${h.ref}. A Mulligan lets you re-post after a miss.`); return; }
-      if (lk) { location.hash = "#unlock"; return; }
-      const sb = sandbagger(playStrokes - h.par, P("me").hcp);
-      rnd[playHole] = playStrokes; save();
-      submit(playHole, playStrokes, { challenge: false, from: null, commit: 0, partner: S.partner, sb, isMulligan: false, returnTo: "#play" });
-    };
+    bindEntry(root, m, hid); bindGps(root);
+    const cs = $("#csim"); if (cs) cs.onclick = () => { if (GPS.G.mode === "sim") { GPS.stop(); return; } GPS.setAuto(true); GPS.D.holeId = m.cur; GPS.startSim(simPath(g, m.cur), { metersPerTick: 20, ms: 1000 }); };
+    $("#cx").onclick = exitCart;
+    const strip = root.querySelector(".c-strip"), cur = strip.querySelector(".cur"); if (cur) strip.scrollLeft = Math.max(0, cur.offsetLeft - (strip.clientWidth - cur.offsetWidth) / 2);
   }
+  function exitCart() { app.classList.remove("cart"); location.hash = M() && !M().done ? "#play" : "#home"; }
 
-  function applyOutdoor() { $("#app").classList.toggle("outdoor", !!S.outdoor); }
+  // ---------- RULES ----------
+  function renderRules() {
+    view.innerHTML = `<div class="screen">
+      ${header("How it works", "30 seconds", `<a class="icon-btn" href="#home" aria-label="Close">${ic("close")}</a>`)}
+      <p class="lede">A head-to-head match on a real course. The course is the board. Every hole is territory.</p>
+      ${rulesCard()}
+      <div class="ways mt16">
+        <div class="way"><div class="way-ic">${ic("phone")}</div><b>Phone vs phone</b><span>Host shows a QR code, your friend scans it. Each phone enters its own score, synced live. Or pass one phone around.</span></div>
+        <div class="way"><div class="way-ic sun">${ic("cart")}</div><b>On the cart</b><span>Cart display mode turns a course cart monitor into the scoreboard, yardage and map.</span></div></div>
+      <div class="rules card mt16"><div class="eyebrow">Stakes</div><p class="muted" style="margin:6px 0 0">Set a per-hole and/or match stake. The app keeps a running ledger and tells you who owes who. Tracking only: no money moves in the app.</p></div>
+      <div data-install class="home-install">${installHtml()}</div>
+      <div class="pad mt16 col"><a class="btn primary block" href="#new">Start a match</a><button class="btn ghost block" id="reset">Reset all data</button></div>
+    </div>`;
+    paintInstall();
+    $("#reset").onclick = () => { NET.stop(); localStorage.removeItem(KEY); const dev = S.dev; S = fresh(); S.dev = dev; S.onboarded = true; save(); toast("All match data cleared."); };
+  }
+  const emptyState = (t, p, href, cta) => `<div class="empty card"><div class="empty-ic">${ic("flag")}</div><b>${t}</b><p>${p}</p><a class="btn primary" href="${href}">${cta}</a></div>`;
+
+  // ---------- router ----------
+  function applyOutdoor() { app.classList.toggle("outdoor", !!S.outdoor); geo._k = null; }
   applyOutdoor();
+  function repaint(full = true) { if (location.hash.startsWith("#cart")) paintCart(); else if (location.hash.startsWith("#play")) paintPlay(); }
+  function route() {
+    const parts = (location.hash.slice(1) || "home").split("/"), r = parts[0];
+    overlayRoot.innerHTML = ""; sheetRoot.innerHTML = "";
+    if (r !== "cart") app.classList.remove("cart");
+    const tab = { new: "play", courses: "play", result: "map", invite: "play" }[r] || r;
+    document.querySelectorAll(".tabbar a").forEach(a => a.classList.toggle("on", a.dataset.tab === tab));
+    tabbar.classList.toggle("hide", ["cart", "new", "courses", "join", "invite"].includes(r));
+    view.scrollTop = 0;
+    if (r === "join") return renderJoin(parts[1]);
+    ({ home: renderHome, new: renderNew, courses: renderCourses, play: renderPlay, map: renderMap, stakes: renderStakes, result: renderResult, cart: renderCart, rules: renderRules, invite: renderInvite }[r] || renderHome)();
+  }
+  window.addEventListener("hashchange", route);
+  window.addEventListener("resize", () => { if (location.hash.startsWith("#cart")) paintCart(); });
 
-  // debugging / screenshot hooks
+  // test / screenshot hooks
   window.FCdev = {
-    syncFromSnapshot: async (type, id, loopIdx = 0) => { const r = await fetch(`data/${type}-${id}.json`); const c = OSM.parseCourse(await r.json(), { key: `${type}/${id}`, source: "snapshot" }); saveCourse(c); return buildBoard(c, c.loops[loopIdx].id).key; },
+    state: () => S, resolve: () => M() && resolve(), net: () => NET.status(),
+    loadQuick: i => loadQuick(QUICK[i || 0]),
     simAtHole: (ref, frac = 0.5) => { const g = geo(); const gh = g.holes.find(h => h.ref === ref); const L = OSM.lineLen(gh.pts); let d = L * frac, p = gh.pts[0];
       for (let i = 1; i < gh.pts.length; i++) { const s = OSM.dist2(gh.pts[i - 1], gh.pts[i]); if (d <= s) { const t = d / s; p = [gh.pts[i - 1][0] + (gh.pts[i][0] - gh.pts[i - 1][0]) * t, gh.pts[i - 1][1] + (gh.pts[i][1] - gh.pts[i - 1][1]) * t]; break; } d -= s; p = gh.pts[i]; }
       GPS.D.auto = true; GPS.D.holeId = null; const ll = g.pj.inv(p); GPS.simAt(ll[0], ll[1], 4); },
-    tapAt: (fx, fy) => { const svg = document.querySelector(".holemap"); const r = svg.getBoundingClientRect(); svg.dispatchEvent(new MouseEvent("click", { clientX: r.left + r.width * fx, clientY: r.top + r.height * fy, bubbles: true })); },
-    geo
+    quickScores: list => { const m = M(); list.forEach((vals, i) => { const hid = m.holes[i]; m.players.forEach((p, j) => setCell(m, hid, p.id, vals[j])); if (!m.log.includes(hid)) m.log.push(hid); }); ordLog(m); m.cur = nextMine(m) || m.cur; playEdit = null; save(); pushState(); route(); }
   };
-
-
-  // ---------- router ----------
-  function route() {
-    const [r, arg] = (location.hash.slice(1) || "home").split("/");
-    if (r !== "unlock") overlayRoot.innerHTML = "";
-    sheetRoot.innerHTML = ""; tabbar.classList.remove("hide");
-    document.querySelectorAll(".tabbar a").forEach(a => a.classList.toggle("on", a.dataset.tab === (r === "how" ? "home" : r === "post" ? "map" : r === "course" || r === "courses" ? "play" : r)));
-    view.scrollTop = 0;
-    if (r === "map" || r === "post") { renderMap(); if (arg && S.holes[arg]) r === "post" ? openPost(arg, false) : openHole(arg); }
-    else if (r === "play") renderPlay();
-    else if (r === "course") renderCourse();
-    else if (r === "courses") renderCourses();
-    else if (r === "army") renderArmy();
-    else if (r === "ranks") renderRanks();
-    else if (r === "how") renderHow();
-    else if (r === "unlock") { if (!view.innerHTML) renderHome(); renderUnlock(); }
-    else renderHome();
-  }
-  window.addEventListener("hashchange", route);
+  if (!S.dev) { S.dev = Math.random().toString(36).slice(2, 10); save(); }
+  netBoot(); flushSignups();
+  window.addEventListener("online", flushSignups);
   route();
-  window.FC = { state: () => S, reset: () => { localStorage.removeItem(KEY); location.reload(); } };
-  if (!GPS.G.fix && board().kind === "osm" && S.gpsAuto !== false && window.isSecureContext && navigator.permissions) navigator.permissions.query({ name: "geolocation" }).then(p => { if (p.state === "granted") GPS.startLive(); }).catch(() => {});
 })();
