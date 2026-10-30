@@ -1,0 +1,5 @@
+Third-party code and fonts (all free, self-hosted)
+- vendor/peerjs.min.js: PeerJS 1.5.5, MIT License, (c) Michelle Bu and Eric Zhang, https://github.com/peers/peerjs
+- vendor/qrcode.js: qrcode-generator 2.0.4, MIT License, (c) Kazuhiko Arase, https://github.com/kazuhikoarase/qrcode-generator
+- fonts/BarlowCond-*.woff2: Barlow Condensed, SIL Open Font License 1.1 (see fonts/OFL-BarlowCondensed.txt)
+- fonts/Bricolage.woff2: Bricolage Grotesque, SIL Open Font License 1.1
