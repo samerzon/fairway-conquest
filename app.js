@@ -394,12 +394,14 @@
         <h1 class="onb-title" id="onb-title">Own the<br><span>course.</span></h1></div>
       <div class="onb-body">
         <p class="onb-sub">Head-to-head on a real course. Win a hole, it's yours. Win by two, steal one.</p>
-        <button class="onb-cta" id="onb-go">Start a match</button>
+        <button class="onb-cta" id="onb-q9">${ic("flag", "#03140a")}Quick 9 with friends</button>
+        <button class="onb-alt" id="onb-go">Set up a full match</button>
         <div data-install class="onb-install">${installHtml()}</div>
         <a class="onb-link" id="onb-how" href="#rules">How it works</a>
       </div></div>`;
     const done = () => { S.onboarded = true; save(); };
     $("#onb-go").onclick = () => { done(); overlayRoot.innerHTML = ""; location.hash = "#new"; };
+    $("#onb-q9").onclick = () => { done(); overlayRoot.innerHTML = ""; location.hash = "#q9"; };
     $("#onb-how").onclick = () => { done(); };
     paintInstall();
   }
@@ -426,7 +428,7 @@
         <div class="eyebrow sun">Head-to-head · real courses</div>
         <h1 class="hero-title">Play your friends.<br><span>Take the course.</span></h1>
         <p>Every hole is territory. Most holes wins.</p>
-        <a class="btn primary big" href="#new">${ic("plus")}New match</a>
+        <div class="hero-ctas"><a class="btn primary big block" href="#q9" id="hero-q9">${ic("flag")}Quick 9 with friends</a><a class="btn ghost block" href="#new">${ic("plus")}New match</a></div>
       </section>`;
     }
     const hist = S.history.slice(0, 5);
@@ -448,6 +450,7 @@
 
   // ---------- NEW MATCH ----------
   function renderNew() {
+    S.pickFor = "new";
     const d = S.draft, b = d.boardKey && S.boards[d.boardKey];
     const boards = Object.values(S.boards);
     const quickLeft = QUICK.filter(q => !boards.some(x => x.courseKey === `${q.type}/${q.id}`));
@@ -503,13 +506,81 @@
     if (c.loops.length > 1) return pickLoopSheet(c);
     useBoard(buildBoard(c, c.loops[0].id));
   }
-  function useBoard(b) { S.draft.boardKey = b.key; S.draft.range = "all"; save(); if (location.hash !== "#new") location.hash = "#new"; else renderNew(); }
+  function useBoard(b) {
+    if (S.pickFor === "q9") { q9d().boardKey = b.key; save(); if (location.hash !== "#q9") location.hash = "#q9"; else renderQ9(); return; }
+    S.draft.boardKey = b.key; S.draft.range = "all"; save(); if (location.hash !== "#new") location.hash = "#new"; else renderNew(); }
+
+
+  // ---------- QUICK 9 (one tap to a 9-hole game with friends) ----------
+  const ANY_KEY = "manual/any#manual9";
+  const q9d = () => S.q9 || (S.q9 = { boardKey: ANY_KEY, players: [{ name: "" }, { name: "" }], mode: "local", stake: { type: "none", hole: 5, match: 20 } });
+  function anyBoard() { return buildBoard({ key: "manual/any", name: "Any course", area: "", loops: [] }, null, 9); }
+  function renderQ9() {
+    S.pickFor = "q9";
+    const d = q9d(), live = M() && !M().done;
+    if (!S.boards[ANY_KEY]) anyBoard();
+    if (!S.boards[d.boardKey]) d.boardKey = ANY_KEY;
+    const osm = Object.values(S.boards).filter(x => x.kind === "osm" || (x.kind === "manual" && x.key !== ANY_KEY));
+    const quickLeft = QUICK.filter(q => !osm.some(x => x.courseKey === `${q.type}/${q.id}`));
+    const seg = (name, opts, cur) => `<div class="seg" data-seg="${name}">${opts.map(([v, l]) => `<button class="${v === cur ? "on" : ""}" data-v="${v}">${l}</button>`).join("")}</div>`;
+    const sub = x => { const n = holeIds(x).length; return n > 9 ? `Front 9 of ${n} · Par ${holeIds(x).slice(0, 9).reduce((a, id) => a + x.holes[id].par, 0)}` : `${n} holes · Par ${parOf(x)}`; };
+    view.innerHTML = `<div class="screen new q9">
+      ${header("Quick 9", "With friends", `<a class="icon-btn" href="#home" aria-label="Close">${ic("close")}</a>`)}
+      <div class="step"><span class="step-n">1</span><h2 class="h2">Course</h2></div>
+      <div class="list">
+        <button class="li pick ${d.boardKey === ANY_KEY ? "sel" : ""}" data-board="${ANY_KEY}"><div class="li-ic">${ic("flag")}</div><div class="li-main"><b>Any course, just 9 holes</b><span>Every hole par 4. Tweak par as you go.</span></div><span class="radio"></span></button>
+        ${osm.map(x => `<button class="li pick ${x.key === d.boardKey ? "sel" : ""}" data-board="${esc(x.key)}"><div class="li-ic">${ic(x.kind === "osm" ? "pin" : "flag")}</div><div class="li-main"><b>${esc(shortName(x.name))}</b><span>${sub(x)}${x.kind === "osm" ? " · GPS" : ""}</span></div><span class="radio"></span></button>`).join("")}
+        ${quickLeft.map(q => `<button class="li pick" data-quick="${q.id}"><div class="li-ic">${ic("pin")}</div><div class="li-main"><b>${esc(shortName(q.name))}</b><span>${esc(q.area)} · Front 9 · GPS</span></div><span class="radio"></span></button>`).join("")}
+        <a class="li ghosty" href="#courses"><div class="li-ic">${ic("search")}</div><div class="li-main"><b>Find a real course</b><span>Search by name or near you</span></div>${ic("chev")}</a>
+      </div>
+      <div class="step"><span class="step-n">2</span><h2 class="h2">Who's playing</h2></div>
+      <div class="list">${d.players.map((p, i) => `<div class="li pl"><i class="pdot lg" style="background:${COLORS[i]}"></i><input data-pname="${i}" value="${esc(p.name)}" placeholder="Player ${i + 1}" maxlength="16" autocomplete="off" enterkeyhint="done">${i > 1 ? `<button class="x" data-prm="${i}" aria-label="Remove">${ic("close")}</button>` : ""}</div>`).join("")}
+        ${d.players.length < 4 ? `<button class="li ghosty" id="addp"><div class="li-ic">${ic("plus")}</div><div class="li-main"><b>Add a player</b><span>Up to 4 on one phone</span></div></button>` : ""}</div>
+      <div class="pad mt8">${seg("mode", [["local", "Pass one phone"], ["invite", "Each on own phone"]], d.mode)}</div>
+      <div class="note">${ic(d.mode === "invite" ? "qr" : "phone")}<span>${d.mode === "invite" ? "<b>Live on two phones.</b> Friends scan a QR code to join. Needs signal on the course." : "<b>One phone, no signal needed.</b> Enter everyone's score after each hole and pass it on."}</span></div>
+      <div class="step"><span class="step-n">3</span><h2 class="h2">Stakes <span class="opt">optional</span></h2></div>
+      <div class="pad">${seg("stake", [["none", "None"], ["hole", "Per hole"], ["match", "Match"]], d.stake.type)}</div>
+      ${d.stake.type !== "none" ? `<div class="stakes-set">
+        ${d.stake.type === "hole" ? `<div class="amt"><span>Per hole won</span><div class="stepper"><button data-amt="hole:-1">−</button><b>$${d.stake.hole}</b><button data-amt="hole:1">+</button></div></div>` : ""}
+        ${d.stake.type === "match" ? `<div class="amt"><span>Match winner</span><div class="stepper"><button data-amt="match:-1">−</button><b>$${d.stake.match}</b><button data-amt="match:1">+</button></div></div>` : ""}
+        <div class="track">${ic("dollar")}Tracking only. No money moves in the app.</div></div>` : ""}
+      <div class="sticky">${live ? `<p class="q9-warn">This replaces the match you have going.</p>` : ""}<button class="btn primary big block" id="q9start">Tee off on hole 1</button></div>
+    </div>`;
+    view.querySelectorAll("[data-board]").forEach(x => x.onclick = () => { d.boardKey = x.dataset.board; save(); renderQ9(); });
+    view.querySelectorAll("[data-quick]").forEach(x => x.onclick = () => loadQuick(QUICK.find(q => q.id === +x.dataset.quick)));
+    view.querySelectorAll("[data-pname]").forEach(x => x.oninput = () => { d.players[+x.dataset.pname].name = x.value; save(); });
+    view.querySelectorAll("[data-prm]").forEach(x => x.onclick = () => { d.players.splice(+x.dataset.prm, 1); save(); renderQ9(); });
+    const ap = $("#addp"); if (ap) ap.onclick = () => { d.players.push({ name: "" }); save(); renderQ9(); const ins = view.querySelectorAll("[data-pname]"); ins[ins.length - 1].focus(); };
+    view.querySelectorAll("[data-seg]").forEach(sg => sg.querySelectorAll("button").forEach(x => x.onclick = () => {
+      const k = sg.dataset.seg, v = x.dataset.v; if (k === "stake") d.stake.type = v; else d[k] = v; save(); renderQ9(); }));
+    const STEPS = [1, 2, 5, 10, 20, 25, 50, 100];
+    view.querySelectorAll("[data-amt]").forEach(x => x.onclick = () => { const [k, dir] = x.dataset.amt.split(":"); const i = STEPS.indexOf(d.stake[k]); d.stake[k] = STEPS[Math.max(0, Math.min(STEPS.length - 1, (i < 0 ? 2 : i) + +dir))]; save(); renderQ9(); });
+    $("#q9start").onclick = () => emailGate(startQ9);
+  }
+  function startQ9() {
+    const d = q9d();
+    if (d.boardKey === ANY_KEY) anyBoard();                                  // fresh par-4 card every new Quick 9
+    const b = S.boards[d.boardKey] || anyBoard();
+    if (M() && !M().done) NET.stop();
+    const players = d.players.map((p, i) => ({ name: (p.name || "").trim() || "Player " + (i + 1) }));
+    newMatch({ boardKey: b.key, range: "all", players, mode: d.mode, stake: { ...d.stake } });
+    S.match.holes = holeIds(b).slice(0, 9); S.match.cur = S.match.holes[0]; S.match.q9 = true;
+    S.onboarded = true; save(); netBoot();
+    location.hash = synced() ? "#invite" : "#play";
+  }
+  function changePar(m, hid, dir) {
+    const h = mBoard(m).holes[hid], np = Math.max(3, Math.min(6, h.par + dir));
+    if (np === h.par) return;
+    h.par = np;
+    if (!m.scores[hid]) playEdit = null;                                     // unscored hole: the steppers start at the new par
+    save(); repaint();
+  }
 
   // ---------- course search (OpenStreetMap) ----------
   let searchState = { q: "", label: "", list: null, busy: false, err: null };
   function renderCourses() {
     view.innerHTML = `<div class="screen">
-      ${header("Find a course", "OpenStreetMap", `<a class="icon-btn" href="#new" aria-label="Back">${ic("back")}</a>`)}
+      ${header("Find a course", "OpenStreetMap", `<a class="icon-btn" href="${S.pickFor === "q9" ? "#q9" : "#new"}" aria-label="Back">${ic("back")}</a>`)}
       <form class="search" id="sform"><input id="q" type="search" placeholder="Course name or town…" value="${esc(searchState.q)}" autocomplete="off" enterkeyhint="search"><button class="btn primary small" type="submit">Search</button></form>
       <div class="pad mt8"><button class="btn ghost block" id="near">${ic("pin")}Courses near me</button></div>
       <div id="sres">${resultsHtml()}</div>
@@ -896,7 +967,7 @@
   }
   function renderPlay() {
     const m = M();
-    if (!m) { view.innerHTML = `<div class="screen">${header("Play")}${emptyState("No match running", "Start one, pick a course, add a friend.", "#new", "New match")}</div>`; return; }
+    if (!m) { view.innerHTML = `<div class="screen">${header("Play")}${emptyState("No match running", "Grab your buddies and play 9.", "#q9", "Quick 9 with friends")}</div>`; return; }
     if (m.done) { location.hash = "#result"; return; }
     view.innerHTML = `<div class="play" id="play"></div>`;
     paintPlay();
@@ -907,6 +978,7 @@
     const m = M(), b = mBoard(m), r = resolve(m), hid = m.cur, h = b.holes[hid], y = yardsFor(hid), g = geo(), gh = geoHole(g, hid);
     const own = r.owner[hid] && pl(r.owner[hid]), glow = own ? own.color : "rgba(190,255,220,.55)";
     const mine = synced(m) ? (m.scores[hid] || {})[myPid(m)] != null : !!m.scores[hid];
+    root.classList.toggle("many", m.players.length >= 3 && !gh);
     root.innerHTML = `
       <div class="play-top"><div style="min-width:0"><div class="eyebrow">${esc(shortName(b.name))}</div></div>
         <div class="hdr-r">${g ? gpsChip() : ""}<a class="icon-btn" href="#cart" aria-label="Cart display">${ic("cart")}</a><button class="icon-btn" id="pmenu" aria-label="Match menu">${ic("more")}</button></div></div>
@@ -914,7 +986,7 @@
       ${synced(m) ? `<div class="play-net" data-net>${netChipHtml()}</div>` : ""}
       <div class="hole-strip" id="strip">${holeStrip(m, r)}</div>
       <div class="stage ${own ? "owned" : "open"}" style="--gc:${glow}">
-        <div class="hole-title"><b>Hole ${h.ref}</b><span>Par ${h.par}${h.yards ? ` · ${h.yards} yds` : ""}</span>${own ? `<em style="color:${own.color}">${esc(own.name)}'s</em>` : `<em>Open</em>`}</div>
+        <div class="hole-title"><b>Hole ${h.ref}</b>${synced(m) ? `<span>Par ${h.par}${h.yards ? ` · ${h.yards} yds` : ""}</span>` : `<span class="par-edit"><button data-par="-1" aria-label="Lower par">−</button>Par <b>${h.par}</b><button data-par="1" aria-label="Raise par">+</button>${h.yards ? `<i>${h.yards} yds</i>` : ""}</span>`}${own ? `<em style="color:${own.color}">${esc(own.name)}'s</em>` : `<em>Open</em>`}</div>
         <div class="stage-glow"></div>
         ${gh ? `<div class="slab-wrap"><div class="slab">${"<i></i>".repeat(6)}<div class="slab-top" id="slab"></div></div></div>` : `<img class="diorama" src="assets/hole-diorama.webp" alt="" width="720" height="458">`}
         ${y ? `<div class="yards"><div class="yd main"><b>${yd(y.center)}</b><span>yds<br><em>${y.fromTee ? "from tee" : "to green"}</em></span></div>
@@ -926,6 +998,7 @@
       <div class="play-foot">${g ? `<button class="mini" id="sim">${ic("redo")}${GPS.G.mode === "sim" ? "Stop GPS sim" : "Simulate GPS"}</button>` : ""}<a class="mini" href="#map">${ic("map")}Territory</a>${m.stake.type !== "none" ? `<a class="mini" href="#stakes">${ic("dollar")}Stakes</a>` : ""}</div>`;
     if (gh) { const el = $("#slab"); el.innerHTML = holeSvg(g, gh, 230, 300, { bg: "#173a24" }).svg; }
     bindEntry(root, m, hid); bindGps(root);
+    root.querySelectorAll("[data-par]").forEach(x => x.onclick = () => changePar(m, hid, +x.dataset.par));
     const strip = $("#strip"), cur = strip.querySelector(".cur"); if (cur) strip.scrollLeft = Math.max(0, cur.offsetLeft - (strip.clientWidth - cur.offsetWidth) / 2);
     const sim = $("#sim"); if (sim) sim.onclick = () => { if (GPS.G.mode === "sim") { GPS.stop(); toast("Simulation stopped."); return; } GPS.setAuto(true); GPS.D.holeId = m.cur; GPS.startSim(simPath(g, m.cur), { metersPerTick: 20, ms: 1000 }); toast("Simulating GPS along the real hole."); };
     $("#pmenu").onclick = () => matchMenu(m);
@@ -1014,27 +1087,52 @@
     if (!m) { location.hash = "#home"; return; }
     if (!m.done) { finishMatch(); return; }
     const r = resolve(m), b = mBoard(m), w = r.leader, st = settle(r.net), me = myPid(m);
-    const iWon = w && w.id === me;
+    const iWon = synced(m) && w && w.id === me;
     const toMe = st.filter(s => s.to === me), fromMe = st.filter(s => s.from === me);
     const sum = a => a.reduce((x, s) => x + s.amt, 0), names = a => a.map(s => pl(s.from === me ? s.to : s.from).name).join(" & ");
-    const owed = toMe.length ? `<div class="owed card"><b>${money(sum(toMe))}</b><span>${esc(names(toMe))} owe${toMe.length > 1 ? "" : "s"} you</span><em>Tracking only</em></div>`
+    const owed = !synced(m) ? "" : toMe.length ? `<div class="owed card"><b>${money(sum(toMe))}</b><span>${esc(names(toMe))} owe${toMe.length > 1 ? "" : "s"} you</span><em>Tracking only</em></div>`
       : fromMe.length ? `<div class="owed card down"><b>${money(sum(fromMe))}</b><span>You owe ${esc(names(fromMe))}</span><em>Tracking only</em></div>` : "";
     const title = iWon ? `You took<br><span>the course.</span>` : w ? `${esc(w.name)} took<br><span>the course.</span>` : `Dead even.<br><span>Nobody takes it.</span>`;
     view.innerHTML = `<div class="screen final" style="--pc:${w ? w.color : "#8a948a"}">
       <div class="res-hero"><img class="res-trophy" src="assets/trophy.webp" alt="" width="720" height="720"><div class="res-fade"></div>
         <div class="eyebrow sun">${esc(shortName(b.name))} · Final</div>
         <h1 class="res-title">${title}</h1>
-        <p class="res-tally">${tally(m, r)}<span>holes</span></p></div>
+        <p class="res-tally">${tally(m, r)}<span>holes</span></p>
+        ${w && r.table[1] && r.table[1].holes === w.holes ? `<p class="res-tb">Tied on holes. ${esc(w.name)} wins on strokes.</p>` : ""}</div>
       ${owed}
       <div class="board-card hex sm terrain">${hexBoard(m, { noCur: true })}</div>
-      <div class="stats card">${r.table.map(t => `<div class="stat-r" style="--pc:${t.color}">${dot(t)}<b>${esc(t.name)}</b><span>${t.holes} holes</span><span>${t.strokes} (${rel(t.toPar)})</span><span>${t.steals} steal${t.steals === 1 ? "" : "s"}</span></div>`).join("")}</div>
+      <div class="stats card">${r.table.map(t => `<div class="stat-r" style="--pc:${t.color}">${dot(t)}<b>${esc(t.name)}</b><span>${t.holes} ${t.holes === 1 ? "hole" : "holes"}</span><span>${t.strokes} (${rel(t.toPar)})</span><span>${t.steals} steal${t.steals === 1 ? "" : "s"}</span></div>`).join("")}</div>
       ${m.stake.type !== "none" ? `<div class="settle card"><div class="eyebrow">Settle up · tracking only</div>${st.length ? st.map(s => `<div class="owe"><span>${esc(pl(s.from).name)}</span>${ic("chev")}<span>${esc(pl(s.to).name)}</span><b>${money(s.amt)}</b></div>`).join("") : `<div class="muted">All square.</div>`}<div class="terms">Pay each other however you like. No money moves in the app.</div></div>` : ""}
-      <div class="pad mt16 col"><button class="btn primary big block" id="rematch">${ic("redo")}Rematch</button><button class="btn ghost block" id="rdone">Done</button></div>
+      ${scorecard(m, r)}
+      <div class="pad mt16 col"><button class="btn primary big block" id="rematch">${ic("redo")}Play again</button>
+        <div class="row2 tight"><button class="btn ghost block" id="rshare">${ic("share")}Share</button><button class="btn ghost block" id="rnew">${ic("plus")}New game</button></div>
+        <button class="btn ghost block" id="rdone">Done</button></div>
     </div>`;
     $("#rematch").onclick = () => { const d = { boardKey: m.boardKey, range: S.draft.range, players: m.players.map(p => ({ name: p.name })), mode: m.mode, stake: { ...m.stake } };
       if (synced(m) && m.net.role !== "host") { const mi = m.players.findIndex(p => p.id === me); if (mi > 0) { const x = d.players[0]; d.players[0] = d.players[mi]; d.players[mi] = x; } }
-      newMatch(d); S.match.holes = m.holes.slice(); S.match.cur = S.match.holes[0]; save(); netBoot(); location.hash = synced() ? "#invite" : "#play"; };
+      newMatch(d); S.match.holes = m.holes.slice(); S.match.cur = S.match.holes[0]; if (m.q9) S.match.q9 = true; save(); netBoot(); location.hash = synced() ? "#invite" : "#play"; };
+    $("#rshare").onclick = () => shareResult(m, r, b, w);
+    $("#rnew").onclick = () => { NET.stop(); S.match = null; save(); location.hash = m.q9 ? "#q9" : "#new"; };
     $("#rdone").onclick = () => { NET.stop(); S.match = null; save(); location.hash = "#home"; };
+  }
+
+  /** Hole-by-hole card: par row, each player's strokes (winner's cell tinted), totals and to-par. */
+  function scorecard(m, r) {
+    const b = mBoard(m), hs = m.holes;
+    const cell = (hid, p) => { const v = m.scores[hid] && m.scores[hid][p.id], ev = r.events.find(e => e.hole === hid), o = !!ev && ev.winner === p.id, d = v != null ? v - b.holes[hid].par : 0;
+      return `<td class="${o ? "won" : ""} ${v != null && d < 0 ? "under" : ""}" style="--pc:${p.color}">${v ?? "·"}</td>`; };
+    return `<div class="card scard"><div class="eyebrow">Scorecard</div><div class="scard-x"><table>
+      <tr class="hd"><th>Hole</th>${hs.map(h => `<td>${b.holes[h].ref}</td>`).join("")}<td class="tot">Tot</td></tr>
+      <tr class="par"><th>Par</th>${hs.map(h => `<td>${b.holes[h].par}</td>`).join("")}<td class="tot">${hs.reduce((a, h) => a + b.holes[h].par, 0)}</td></tr>
+      ${m.players.map(p => { const t = r.table.find(x => x.id === p.id); return `<tr><th>${dot(p)}<span>${esc(p.name)}</span></th>${hs.map(h => cell(h, p)).join("")}<td class="tot">${t.strokes}<small>${r.played.length ? rel(t.toPar) : ""}</small></td></tr>`; }).join("")}
+    </table></div></div>`;
+  }
+  async function shareResult(m, r, b, w) {
+    const url = location.href.split("#")[0].split("?")[0];
+    const text = `${shortName(b.name)} · ${m.holes.length} holes\n${w ? `${w.name} took the course.` : "Dead even."}\n` +
+      r.table.map(t => `${t.name}: ${t.holes} hole${t.holes === 1 ? "" : "s"}, ${t.strokes} (${rel(t.toPar)})`).join("\n") + `\nPlay Fairway Conquest: ${url}`;
+    try { if (navigator.share) { await navigator.share({ title: "Fairway Conquest", text }); return; } } catch (e) { if (e && e.name === "AbortError") return; }
+    try { await navigator.clipboard.writeText(text); toast("Result copied. Paste it in the group chat."); } catch (e) { toast("Couldn't share from this browser."); }
   }
 
   // ---------- CART DISPLAY (landscape course monitor) ----------
@@ -1082,6 +1180,7 @@
       svg.addEventListener("click", e => { const pt = svg.createSVGPoint(); pt.x = e.clientX; pt.y = e.clientY; const q = pt.matrixTransform(svg.getScreenCTM().inverse()); tapPt = hm.Ti([q.x, q.y]); paintCart(); });
     }
     bindEntry(root, m, hid); bindGps(root);
+    root.querySelectorAll("[data-par]").forEach(x => x.onclick = () => changePar(m, hid, +x.dataset.par));
     const cs = $("#csim"); if (cs) cs.onclick = () => { if (GPS.G.mode === "sim") { GPS.stop(); return; } GPS.setAuto(true); GPS.D.holeId = m.cur; GPS.startSim(simPath(g, m.cur), { metersPerTick: 20, ms: 1000 }); };
     $("#cx").onclick = exitCart;
     const strip = root.querySelector(".c-strip"), cur = strip.querySelector(".cur"); if (cur) strip.scrollLeft = Math.max(0, cur.offsetLeft - (strip.clientWidth - cur.offsetWidth) / 2);
@@ -1114,12 +1213,12 @@
     const parts = (location.hash.slice(1) || "home").split("/"), r = parts[0];
     overlayRoot.innerHTML = ""; sheetRoot.innerHTML = "";
     if (r !== "cart") app.classList.remove("cart");
-    const tab = { new: "play", courses: "play", result: "map", invite: "play" }[r] || r;
+    const tab = { new: "play", q9: "play", courses: "play", result: "map", invite: "play" }[r] || r;
     document.querySelectorAll(".tabbar a").forEach(a => a.classList.toggle("on", a.dataset.tab === tab));
-    tabbar.classList.toggle("hide", ["cart", "new", "courses", "join", "invite"].includes(r));
+    tabbar.classList.toggle("hide", ["cart", "new", "q9", "courses", "join", "invite"].includes(r));
     view.scrollTop = 0;
     if (r === "join") return renderJoin(parts[1]);
-    ({ home: renderHome, new: renderNew, courses: renderCourses, play: renderPlay, map: renderMap, stakes: renderStakes, result: renderResult, cart: renderCart, rules: renderRules, invite: renderInvite }[r] || renderHome)();
+    ({ home: renderHome, new: renderNew, courses: renderCourses, play: renderPlay, map: renderMap, stakes: renderStakes, result: renderResult, cart: renderCart, rules: renderRules, invite: renderInvite, q9: renderQ9 }[r] || renderHome)();
   }
   window.addEventListener("hashchange", route);
   window.addEventListener("resize", () => { if (location.hash.startsWith("#cart")) paintCart(); });

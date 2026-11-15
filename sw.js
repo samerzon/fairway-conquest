@@ -1,11 +1,12 @@
 /* Fairway Conquest service worker: app shell offline, course data cached as you use it. */
-const VERSION = "fc-v3.0.0";
+const VERSION = "fc-v3.1.0";
 const SHELL = ["./", "index.html", "styles.css", "config.js", "osm.js", "gps.js", "net.js", "app.js",
   "vendor/peerjs.min.js", "vendor/qrcode.js", "manifest.webmanifest", "favicon.svg",
-  "icons/icon-192.png", "icons/apple-touch-icon.png",
+  "icons/icon-192.png", "icons/icon-512.png", "icons/icon-maskable-192.png", "icons/icon-maskable-512.png", "icons/apple-touch-icon.png",
+  "data/way-61499695.json", "data/way-78388948.json",
   "fonts/BarlowCond-600.woff2", "fonts/BarlowCond-800.woff2", "fonts/BarlowCond-800i.woff2", "fonts/BarlowCond-900i.woff2", "fonts/Bricolage.woff2",
   "assets/hero-sunset.webp", "assets/hero-sunset-wide.webp", "assets/hole-diorama.webp", "assets/trophy.webp", "assets/desert-aerial.webp"];
-self.addEventListener("install", e => { e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting())); });
+self.addEventListener("install", e => { e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL.map(u => new Request(u, { cache: "reload" })))).then(() => self.skipWaiting())); });
 self.addEventListener("activate", e => { e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== VERSION).map(k => caches.delete(k)))).then(() => self.clients.claim())); });
 self.addEventListener("fetch", e => {
   const req = e.request, url = new URL(req.url);
